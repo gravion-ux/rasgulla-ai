@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rasgulla-ai"
+version = "0.1.0"
+description = "A local-first AI-assisted security research workbench for code understanding, safe test generation, and reproducible debugging."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+rasgulla_ai = "rasgulla.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
