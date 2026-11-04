@@ -3,6 +3,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".c", ".h", ".cpp", ".rs", ".go"}
+# Dependency, build and cache directories hold third-party or generated code, not project source.
+IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist",
+                ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".eggs",
+                "site-packages"}
 
 @dataclass
 class Finding:
@@ -28,13 +32,32 @@ RULES = [
      "Possible hard-coded secret", "Move secrets to a managed secret store and rotate exposed credentials."),
 ]
 
+def _is_ignored(path: Path, root: Path) -> bool:
+    # Only directory components below the scan root are ignored, so a project that
+    # happens to live under a directory with an ignored name is still scanned.
+    try:
+        parts = path.relative_to(root).parts[:-1]
+    except ValueError:
+        parts = path.parts[:-1]
+    return any(part in IGNORED_DIRS for part in parts)
+
+
+def _display_path(path: Path, base: Path | None) -> str:
+    if base:
+        try:
+            return str(path.relative_to(base))
+        except ValueError:
+            pass
+    return str(path)
+
+
 def analyze_file(path: Path, base: Path | None = None):
     results = []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return results
-    display = str(path.relative_to(base)) if base else str(path)
+    display = _display_path(path, base)
     for number, line in enumerate(lines, 1):
         for rule_id, severity, pattern, message, recommendation in RULES:
             if pattern.search(line):
@@ -47,7 +70,7 @@ def analyze_path(root: Path):
     findings = []
     files = [root] if root.is_file() else sorted(
         x for x in root.rglob("*") if x.is_file() and x.suffix.lower() in EXTENSIONS
-        and not any(part in {".git", ".venv", "node_modules"} for part in x.parts)
+        and not _is_ignored(x, root)
     )
     for file in files:
         if file.suffix.lower() in EXTENSIONS:
