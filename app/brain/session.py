@@ -28,15 +28,8 @@ for _p in (str(APP_DIR), str(BRAIN_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import pyautogui  # noqa: E402
-
-from core_app import (  # noqa: E402
-    BLOCKED_SUFFIXES,
-    MAX_READ_CHARS,
-    MAX_WRITE_CHARS,
-    NAVIGATION_KEYS,
-    SAFE_APPS,
-    SAFE_HOTKEYS,
+import pyautogui
+from core_app import (
     WORK_DIR,
     freedom_gauge,
     local_intent,
@@ -44,24 +37,21 @@ from core_app import (  # noqa: E402
     voice_line,
 )
 from core_app import RasgullaApp as _RasgullaApp
-from core_router import (  # noqa: E402
+from core_router import (
     ModelRouter,
     RouterError,
     TaskClassifier,
     UsageTracker,
     read_api_key,
 )
-from voice_engine import (  # noqa: E402
+from voice_engine import (
     clean_for_speech,
     pick_voice,
-    speak,
     stop,
-    synthesize_wav,
-    voice_for,
 )
 
 try:  # tts lives next door in app/brain
-    from tts import synthesize as tts_synthesize  # noqa: E402
+    from tts import synthesize as tts_synthesize
 
     TTS_AVAILABLE = True
 except Exception:  # noqa: BLE001 - TTS is optional at import time
@@ -76,7 +66,8 @@ USAGE_PATH = APP_DIR / "usage.json"
 class _BrainShim:
     """Minimal object carrying the instance state the bound guards need."""
 
-    action_rejections: list[str] = []
+    def __init__(self) -> None:
+        self.action_rejections: list[str] = []
 
 
 _shim = _BrainShim()
@@ -179,7 +170,7 @@ class BrainSession:
 
     def __init__(self) -> None:
         WORK_DIR.mkdir(parents=True, exist_ok=True)
-        self.outbox: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self.outbox: queue.Queue[dict[str, Any]] = queue.Queue()
         self.router: ModelRouter | None = None
         self.config_error = ""
         self.key = ""
@@ -325,7 +316,7 @@ class BrainSession:
         if mode is None:
             mode = self.mode
         emergency = request.strip().startswith(",,")
-        from core_app import build_system_prompt  # noqa: E402
+        from core_app import build_system_prompt
 
         messages = [{"role": "system", "content": build_system_prompt(mode, emergency)}]
         recent = self.history[-8:]
@@ -349,7 +340,7 @@ class BrainSession:
         return messages
 
     def _tier_brief(self, tier: str) -> str:
-        from core_app import TIER_BRIEF  # noqa: E402
+        from core_app import TIER_BRIEF
 
         return TIER_BRIEF.get(tier, "")
 
@@ -394,7 +385,7 @@ class BrainSession:
                 payload["audio"] = tts_result.get("audio", "")
                 payload["words"] = tts_result.get("words", [])
                 payload["mime"] = tts_result.get("mime", "audio/mpeg")
-            except Exception:  # noqa: BLE001 - TTS failure is not fatal
+            except Exception:  # noqa: BLE001, S110 - TTS failure is not fatal; the orb falls back to its estimated envelope
                 pass
         return payload
 
@@ -455,7 +446,7 @@ class BrainSession:
             self._emit({"type": "error", "message": "the offline voice model is missing"})
             return
         recognizer = KaldiRecognizer(Model(str(model_path)), 16000)
-        audio_q: "queue.Queue[bytes]" = queue.Queue()
+        audio_q: queue.Queue[bytes] = queue.Queue()
 
         def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
             if not status:

@@ -7,14 +7,12 @@ voice_engine.synthesize_wav when the neural path is unavailable.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 from typing import Any
 
 import edge_tts
-
-from voice_engine import pick_voice, synthesize_wav, voice_for
+from voice_engine import synthesize_wav, voice_for
 
 
 def synthesize(text: str, voice_id: str | None = None) -> dict[str, Any]:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sys
 
-from session import BrainSession  # noqa: E402
+from session import BrainSession
 
 
 def main() -> int:

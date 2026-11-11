@@ -15,7 +15,7 @@ for _p in (str(APP_DIR), str(BRAIN)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from session import BrainSession  # noqa: E402
+from session import BrainSession
 
 PASSED = 0
 FAILED: list[str] = []
@@ -49,8 +49,9 @@ def test_local_intent_time():
 
 
 def test_validate_actions_through_shim():
-    from core_app import RasgullaApp as _App
     from types import MethodType
+
+    from core_app import RasgullaApp as _App
 
     shim = type("Shim", (), {"action_rejections": []})()
     validator = MethodType(_App.validate_actions, shim)
@@ -72,8 +73,9 @@ def test_validate_actions_through_shim():
 
 
 def test_rejects_unsafe_action():
-    from core_app import RasgullaApp as _App
     from types import MethodType
+
+    from core_app import RasgullaApp as _App
 
     shim = type("Shim", (), {"action_rejections": []})()
     validator = MethodType(_App.validate_actions, shim)
