@@ -1,0 +1,13 @@
+{
+  "name": "rasgulla-orb",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rasgulla - speaking orb desktop assistant",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

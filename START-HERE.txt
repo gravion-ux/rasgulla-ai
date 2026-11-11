@@ -1,0 +1,33 @@
+Rasgulla - her own folder
+=========================
+
+This is the canonical home of the Rasgulla desktop agent.
+Path: C:\Users\priya\Documents\Rasgulla
+
+START IT
+    Double-click "Run Rasgulla.cmd"
+
+WHAT IS IN HERE
+    rasgulla.py        entry point
+    core_app.py       the window, the pet, the persona, the action engine
+    core_router.py    model routing, rate limiting, usage counters, redaction
+    voice_engine.py   speaking voice (Indian female voices, offline fallback)
+    pet_sprite.py     builds the pet badge, animation frames and speech bubbles
+    models.json       routing table, model aliases, timeouts
+    requirements.txt  pinned Python packages
+    assets/           avatars, pet sprite, animation frames
+    models/           offline speech-to-text models for the microphone
+    work/             files she writes during coding tasks
+    .venv/            Python environment - do not move or rename
+    usage.json        token and latency counters
+    test_rasgulla.py  local test suite (no network)
+
+SHE SPEAKS
+    Use the "Speaking voice" dropdown in the panel and the "Hear her" button.
+    Automatic mode follows the script: Hindi voice for Devanagari, Indian
+    English for Hinglish and English.
+
+TESTS
+    .venv\Scripts\python.exe test_rasgulla.py
+
+Moved here 29 Oct 2026 from the dated conversation output folder.

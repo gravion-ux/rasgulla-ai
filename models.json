@@ -1,0 +1,107 @@
+{
+  "_comment": "Free-endpoint model routing. Every entry is a free prototyping endpoint on the same key; nothing here is a paid endpoint. The router tries 'chain' in order and auto-falls-back when a model errors, times out or hits a rate limit.",
+  "_chain_note": "The lead model of each tier must answer on the free endpoint. Verified 30 Oct 2026: deepseek-ai/deepseek-v4.1-flash hangs past 30s even on a four-token prompt and z-ai/glm-5.3 answers 410 Gone. Verified again on 01 Nov 2026 during a live run: minimaxai/minimax-m3.1-flash answered 429 rate limited and both nvidia/nemotron-3.5-lightning-30b-a3b and stepfun-ai/step-5-preview then hung past their timeouts, so a chat request failed after 105 seconds. Every tier now leads with nvidia/nemotron-3-ultra-550b-a55b or nvidia/nemotron-3.5-lightning-30b-a3b, which answered a 2373-token reply in 5.25 seconds. The three picked models stay in the chains and in the aliases; the router also retires a model that times out or is gone, so a dead lead can never block a request again.",
+  "endpoint": "https://integrate.api.nvidia.com/v1/chat/completions",
+  "key_env": [
+    "RASGULLA_API_KEY",
+    "NVIDIA_API_KEY"
+  ],
+  "defaults": {
+    "requests_per_minute": 20,
+    "timeout_seconds": 90,
+    "deep_timeout_seconds": 200,
+    "cooldown_rate_limit_seconds": 90,
+    "cooldown_timeout_seconds": 300,
+    "max_attempts_per_request": 4
+  },
+  "model_timeouts": {
+    "deepseek-ai/deepseek-v4.1-flash": 20,
+    "z-ai/glm-5.3": 150,
+    "nvidia/nemotron-3-ultra-550b-a55b": 60,
+    "nvidia/nemotron-3.5-lightning-30b-a3b": 45,
+    "nvidia/nemotron-3.5-super-vl-120b-a12b": 90,
+    "nvidia/nemotron-3.5-bolt-e4b": 45,
+    "minimaxai/minimax-m3.1-flash": 45,
+    "stepfun-ai/step-5-preview": 60
+  },
+  "tiers": {
+    "chat": {
+      "label": "Flash",
+      "temperature": 0.55,
+      "max_tokens": 4000,
+      "chain": [
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "minimaxai/minimax-m3.1-flash",
+        "stepfun-ai/step-5-preview"
+      ]
+    },
+    "code": {
+      "label": "Abyss",
+      "temperature": 0.2,
+      "max_tokens": 4000,
+      "chain": [
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "minimaxai/minimax-m3.1-flash",
+        "deepseek-ai/deepseek-v4.1-flash"
+      ]
+    },
+    "reason": {
+      "label": "Zenith",
+      "temperature": 0.25,
+      "max_tokens": 4000,
+      "timeout_seconds": 200,
+      "chain": [
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "minimaxai/minimax-m3.1-flash",
+        "z-ai/glm-5.3"
+      ]
+    },
+    "vision": {
+      "label": "Super VL",
+      "temperature": 0.2,
+      "max_tokens": 2500,
+      "chain": [
+        "nvidia/nemotron-3.5-super-vl-120b-a12b",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "minimaxai/minimax-m3.1-flash"
+      ]
+    },
+    "creative": {
+      "label": "Muse",
+      "temperature": 0.9,
+      "max_tokens": 4000,
+      "chain": [
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "minimaxai/minimax-m3.1-flash",
+        "stepfun-ai/step-5-preview"
+      ]
+    },
+    "security": {
+      "label": "Ultra",
+      "temperature": 0.3,
+      "max_tokens": 4000,
+      "chain": [
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "minimaxai/minimax-m3.1-flash",
+        "stepfun-ai/step-5-preview"
+      ]
+    }
+  },
+  "aliases": {
+    "minimaxai/minimax-m3.1-flash": "Flash",
+    "deepseek-ai/deepseek-v4.1-flash": "Abyss",
+    "z-ai/glm-5.3": "Zenith",
+    "z-ai/glm-5.3-flash": "Zenith Flash",
+    "nvidia/nemotron-3.5-lightning-30b-a3b": "Lightning",
+    "nvidia/nemotron-3.5-bolt-e4b": "Bolt",
+    "nvidia/nemotron-3-ultra-550b-a55b": "Ultra",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b": "Super VL",
+    "stepfun-ai/step-5-preview": "Step"
+  }
+}
