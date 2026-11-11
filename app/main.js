@@ -193,3 +193,17 @@ ipcMain.handle('window:hide-pet', (_event) => {
   }
   return { ok: true };
 });
+
+ipcMain.handle('pet_move', (_event, { dx, dy }) => {
+  if (!petWindow) return { ok: false };
+  const [x, y] = petWindow.getPosition();
+  petWindow.setPosition(x + dx, y + dy);
+  return { ok: true };
+});
+
+ipcMain.handle('focus_orb', (_event) => {
+  if (orbWindow) {
+    orbWindow.focus();
+  }
+  return { ok: true };
+});
