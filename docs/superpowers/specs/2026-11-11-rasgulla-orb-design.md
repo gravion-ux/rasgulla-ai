@@ -176,7 +176,8 @@ exists because an always-on-top chat panel fights with every other window.
 
 Layout, top to bottom: header, title strip ("Your work partner needs a face."),
 the three-state segmented pill (LISTENING / THINKING / SPEAKING, active segment
-lit), the orb canvas, the caption strip, and the input row.
+lit), the orb element - which renders its own caption strip under the sphere -
+and the input row.
 
 The orb is the vendored custom element:
 
@@ -202,6 +203,29 @@ idle line, double-click focuses the orb window, and the window can be dragged.
 
 The sprite is re-tinted, not redrawn: the frames stay the user's own asset.
 
+### 5.4 Vendored component contract (verified against the vendored source)
+
+- Observed attributes are `state`, `level` and `particles`. `state` has a
+  setter; `level` is read from the attribute, so the renderer writes it with
+  `setAttribute('level', value)`. `particles` is clamped to 200..20000.
+- `say(text, {words, audio})` takes `words` as a list of `w`, `start`, `end`
+  in seconds from the start of the audio. The component maps the word index
+  onto the whitespace-split tokens of `text`, so the text handed to `say()`
+  must be exactly the text that was synthesised - otherwise the caption words
+  drift away from the voice.
+- The component takes the audio element over itself: it builds a media
+  element source, connects an analyser to the destination and plays the
+  element. One audio element is reused for the whole session and only its
+  `src` changes, so the analyser stays attached to the same node.
+- When the line finishes, the state falls back to the `rest` attribute
+  (`listening` here) and an `end` event fires.
+- The `recording` attribute stops the render loop, so it is never set: the
+  microphone belongs to the Python brain and the level is streamed in.
+- Captions live in an open shadow root under `.cap` and are styled with the
+  custom properties `--cap`, `--cap-size`, `--cap-font` and `--cap-w`.
+- State colours: listening amber, thinking violet, searching cyan, speaking
+  pink, done green.
+
 ## 6. Visual language
 
 - Background: `#08070b` to `#120b16`, with a soft radial glow behind the orb.
@@ -225,10 +249,11 @@ exactly that section and is reused unchanged.
    audio chunks and one `WordBoundary` event per word. The brain collects the
    mp3 bytes and a word list of `w`, `start`, `end` offsets.
 3. The brain sends base64 mp3 plus the word list to the renderer.
-4. The renderer builds a Blob URL, wraps it in an `Audio` element and calls
-   `orb.say(text, { audio, words })`. The orb then follows the real signal and
-   lands each caption exactly on its word. Captions are rendered by the
-   component's own particle-dust effect.
+4. The renderer builds a Blob URL, points the one shared audio element at it
+   and calls `orb.say(text, { audio, words })`, where `text` is exactly the
+   text that was synthesised. The orb then follows the real signal and lands
+   each caption exactly on its word. Captions are rendered by the component's
+   own particle-dust effect.
 5. Fallback: if the neural path fails, `voice_engine.synthesize_wav` produces
    WAV bytes, which the renderer plays the same way, with the whole line as
    one caption. If both fail, the orb still runs on its estimated envelope and
