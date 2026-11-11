@@ -29,6 +29,7 @@ for _p in (str(APP_DIR), str(BRAIN_DIR)):
         sys.path.insert(0, _p)
 
 import pyautogui
+
 from core_app import (
     WORK_DIR,
     freedom_gauge,
