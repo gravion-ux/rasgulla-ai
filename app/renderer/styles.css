@@ -1,0 +1,284 @@
+:root {
+  --bg: #08070b;
+  --panel: #120b16;
+  --ink: #f4eef5;
+  --muted: #a89bb0;
+  --amber: #f5a524;
+  --pink: #ec4899;
+  --violet: #8b5cf6;
+  --cyan: #22d3ee;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  overflow: hidden;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+.shell-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.35);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+.shell-header .brand {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--amber);
+}
+
+.shell-header .controls {
+  display: flex;
+  gap: 6px;
+}
+
+.shell-header button {
+  -webkit-app-region: no-drag;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: var(--ink);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.shell-header button:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.strip {
+  padding: 10px 14px 4px;
+}
+
+.strip h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.pill {
+  display: flex;
+  gap: 8px;
+  padding: 0 14px 10px;
+}
+
+.pill button {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pill button[aria-pressed="true"] {
+  background: var(--amber);
+  color: #0b0a08;
+  border-color: var(--amber);
+  font-weight: 700;
+}
+
+speaking-orb {
+  display: block;
+  margin: 0 auto;
+  width: 260px;
+  height: 260px;
+  --cap: #f4eef5;
+  --cap-size: 20px;
+}
+
+.input-row {
+  display: flex;
+  gap: 8px;
+  padding: 6px 14px 10px;
+}
+
+.input-row input {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--ink);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+
+.input-row input::placeholder {
+  color: var(--muted);
+}
+
+.input-row button {
+  -webkit-app-region: no-drag;
+  background: var(--amber);
+  color: #0b0a08;
+  border: none;
+  border-radius: 10px;
+  padding: 8px 16px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.input-row button:hover {
+  filter: brightness(1.15);
+}
+
+.panel {
+  padding: 0 14px 14px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.transcript {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.transcript .speaker {
+  color: var(--pink);
+  font-weight: 700;
+}
+
+.transcript .me {
+  color: var(--cyan);
+  font-weight: 700;
+}
+
+.transcript .note {
+  color: #8a5a72;
+  font-style: italic;
+}
+
+.plan-card {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 10px;
+  margin-bottom: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.plan-card.hidden,
+.confirm-card.hidden {
+  display: none;
+}
+
+.plan-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.plan-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.plan-row input[type="checkbox"] {
+  -webkit-app-region: no-drag;
+}
+
+.plan-row .desc {
+  flex: 1;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.plan-row .rejected {
+  color: #ef4444;
+  font-size: 12px;
+}
+
+.plan-buttons {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.plan-buttons button {
+  -webkit-app-region: no-drag;
+  flex: 1;
+  background: var(--pink);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.plan-buttons button:hover {
+  filter: brightness(1.1);
+}
+
+.confirm-card {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 10px;
+  margin-bottom: 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+#confirm-text {
+  font-size: 13px;
+  color: var(--ink);
+  margin-bottom: 8px;
+}
+
+.confirm-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.confirm-buttons button {
+  -webkit-app-region: no-drag;
+  flex: 1;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+#btnConfirmYes {
+  background: var(--amber);
+  color: #0b0a08;
+}
+
+#btnConfirmNo {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--ink);
+}
+
+.route-caption {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 8px;
+}
