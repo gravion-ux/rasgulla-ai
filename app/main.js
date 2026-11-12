@@ -15,6 +15,7 @@ const BRAIN_ENTRY = path.join(APP_DIR, 'brain', 'brain.py');
 const PROBE_MODE = process.argv.includes('--probe');
 const LIVE_PROBE_MODE = process.argv.includes('--probe-live');
 const SHOT_MODE = process.argv.includes('--probe-shot');
+const TALK_MODE = process.argv.includes('--probe-talk');
 
 let orbWindow = null;
 let brainProcess = null;
@@ -23,6 +24,9 @@ let shuttingDown = false;
 let pendingId = 0;
 const pending = new Map();
 const served = { orbScript: false };
+// How many messages of each kind the brain has sent, so a probe can tell
+// what really arrived instead of what was asked for.
+const brainCounts = { total: 0, level: 0, mic_state: 0, transcript: 0, plan: 0 };
 
 // The scheme has to be declared before the app is ready.  It is deliberately
 // not a "standard" scheme, so Chromium hands the request over as the exact
@@ -112,6 +116,9 @@ function spawnBrain() {
       if (!line.trim()) continue;
       let message;
       try { message = JSON.parse(line); } catch (_) { continue; }
+      const kind = message && message.type;
+      brainCounts.total += 1;
+      if (typeof brainCounts[kind] === 'number') brainCounts[kind] += 1;
       const id = message.id;
       const resolver = id != null ? pending.get(id) : null;
       if (resolver) {
@@ -223,6 +230,8 @@ app.whenReady().then(async () => {
     await runLiveProbe();
   } else if (SHOT_MODE) {
     await runShotProbe();
+  } else if (TALK_MODE) {
+    await runTalkProbe();
   } else if (PROBE_MODE) {
     await runProbe();
   }
@@ -378,6 +387,82 @@ async function runShotProbe() {
   console.log(`RASGULLA_SHOT_LAYOUT ${JSON.stringify(layout)}`);
   stopBrain();
   app.exit(0);
+}
+
+const TALK_PROBE = `(() => {
+  const orb = document.getElementById("orb");
+  const cap = orb && orb.shadowRoot ? orb.shadowRoot.querySelector(".cap") : null;
+  const active = document.querySelector('.pill button[aria-pressed="true"]');
+  return {
+    phase: active ? active.textContent.trim().toLowerCase() : null,
+    captionText: cap ? cap.textContent : "",
+    orbState: orb ? orb.getAttribute("state") : null
+  };
+})()`;
+
+async function runTalkProbe() {
+  // The whole point of the app: click the orb, it hears you, it answers.
+  await waitForLoad(orbWindow);
+  await sleep(2500);
+
+  // One link: a level event from the brain has to move the orb.
+  orbWindow.webContents.send('brain:event', { type: 'level', value: 0.77 });
+  await sleep(600);
+  const orbLevel = await orbWindow.webContents.executeJavaScript(
+    '(() => { const o = document.getElementById("orb"); return o ? Number(o.getAttribute("level")) : null; })()'
+  );
+
+  // Two links: the click has to open the real microphone, which then starts
+  // sending levels of its own.
+  const levelsBefore = brainCounts.level;
+  await orbWindow.webContents.executeJavaScript(
+    '(() => { document.getElementById("orb").click(); return true; })()'
+  );
+  await sleep(4000);
+  const micLevels = brainCounts.level - levelsBefore;
+
+  // Close the microphone again and wait for the brain to say it is idle.
+  await sendToBrain({ command: 'mic', on: false });
+  await sleep(1500);
+  const micClosedEvents = brainCounts.mic_state;
+
+  // Three links: a final transcript has to start a real answer.
+  const plansBefore = brainCounts.plan;
+  orbWindow.webContents.send('brain:event', {
+    type: 'transcript',
+    text: 'what time is it',
+    final: true,
+  });
+  let phase = null;
+  let captionText = '';
+  for (let i = 0; i < 40; i++) {
+    await sleep(1000);
+    const state = await orbWindow.webContents.executeJavaScript(TALK_PROBE);
+    phase = state.phase;
+    captionText = state.captionText;
+    if (phase === 'speaking' && captionText.trim().length > 0) break;
+  }
+  const planEvents = brainCounts.plan - plansBefore;
+
+  const talk = {
+    orbLevel: orbLevel,
+    micLevels: micLevels,
+    micClosedEvents: micClosedEvents,
+    planEvents: planEvents,
+    phase: phase,
+    captionText: captionText,
+    ok: Boolean(
+      orbLevel === 0.77 &&
+      micLevels > 0 &&
+      micClosedEvents > 0 &&
+      planEvents > 0 &&
+      phase === 'speaking' &&
+      captionText.trim().length > 0
+    ),
+  };
+  console.log(`RASGULLA_TALK ${JSON.stringify(talk)}`);
+  stopBrain();
+  app.exit(talk.ok ? 0 : 1);
 }
 
 async function runProbe() {
