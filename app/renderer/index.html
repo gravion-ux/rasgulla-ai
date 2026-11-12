@@ -9,53 +9,20 @@
 </head>
 <body>
 <div class="app">
-  <div class="orb-column">
-    <header class="shell-header">
-      <div class="brand">Rasgulla</div>
-      <div class="controls">
-        <button id="btnPin" title="Pin/unpin">pin</button>
-        <button id="btnCollapse" title="Expand the chat panel">expand</button>
-        <button id="btnClose" title="Close">&#215;</button>
-      </div>
-    </header>
-
-    <div class="strip">
-      <h1>Your work partner needs a face.</h1>
+  <header class="shell-header">
+    <div class="brand" id="brand">Rasgulla</div>
+    <div class="controls">
+      <button id="btnClose" title="Close" aria-label="Close">&times;</button>
     </div>
+  </header>
 
-    <div class="pill" role="tablist" aria-label="Orb state">
-      <button role="tab" data-state="listening" aria-pressed="true">Listening</button>
-      <button role="tab" data-state="thinking">Thinking</button>
-      <button role="tab" data-state="speaking">Speaking</button>
-    </div>
-
-    <speaking-orb id="orb" state="listening" level="0" particles="12000" rest="listening"></speaking-orb>
-
-    <div class="input-row">
-      <input id="entry" type="text" placeholder="Ask Rasgulla..." autocomplete="off">
-      <button id="btnSend">Plan</button>
-    </div>
+  <div class="pill" role="tablist" aria-label="Orb state">
+    <button role="tab" data-state="listening" aria-pressed="true">Listening</button>
+    <button role="tab" data-state="thinking" aria-pressed="false">Thinking</button>
+    <button role="tab" data-state="speaking" aria-pressed="false">Speaking</button>
   </div>
 
-  <div id="panel" class="panel hidden">
-    <div id="transcript" class="transcript"></div>
-    <div id="plan-card" class="plan-card hidden">
-      <div class="plan-title">Proposed actions - nothing has run yet</div>
-      <div id="plan-list"></div>
-      <div class="plan-buttons">
-        <button id="btnRunPlan">Run approved plan</button>
-        <button id="btnClearPlan">Clear</button>
-      </div>
-    </div>
-    <div id="confirm-card" class="confirm-card hidden">
-      <div id="confirm-text"></div>
-      <div class="confirm-buttons">
-        <button id="btnConfirmYes">Run</button>
-        <button id="btnConfirmNo">Skip</button>
-      </div>
-    </div>
-    <div id="route-caption" class="route-caption"></div>
-  </div>
+  <speaking-orb id="orb" state="listening" level="0" particles="12000" rest="listening" title="Click the orb to talk"></speaking-orb>
 </div>
 
 <audio id="voice" src=""></audio>

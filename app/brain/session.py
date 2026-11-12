@@ -11,8 +11,10 @@ Everything else is module-level in core_app, so binding works unchanged.
 
 from __future__ import annotations
 
+import array
 import ctypes
 import json
+import math
 import queue
 import sys
 import threading
@@ -50,6 +52,7 @@ from voice_engine import (
     clean_for_speech,
     pick_voice,
     stop,
+    voice_for,
 )
 
 try:  # tts lives next door in app/brain
@@ -63,6 +66,70 @@ except Exception:  # noqa: BLE001 - TTS is optional at import time
 MODELS_DIR = PROJECT_ROOT / "models"
 CONFIG_PATH = PROJECT_ROOT / "models.json"
 USAGE_PATH = PROJECT_ROOT / "usage.json"
+
+# The plain Indian English voice.  It is the fallback whenever a preset has no
+# neural voice of its own, and the voice `auto` replaces with the lively one.
+PLAIN_ENGLISH_VOICE_ID = "en-IN-NeerjaNeural"
+
+# -- microphone tuning --------------------------------------------------------
+#
+# The microphone runs at 16 kHz.  Levels are the RMS of a chunk normalised to
+# 0..1, so ordinary speech sits near the middle of the range instead of
+# pinning the orb at either end.
+MIC_SAMPLE_RATE = 16000
+MIC_BLOCK_FRAMES = 1600
+LEVEL_INTERVAL = 0.05  # at most twenty level events a second
+SILENCE_SECONDS = 1.35  # how long the room has to stay quiet before we stop
+SPEECH_LEVEL = 0.10  # above this the room counts as somebody talking
+SILENCE_LEVEL = 0.03  # below this the room counts as quiet
+FULL_SCALE_RMS = 8000.0  # the int16 RMS that fills the orb
+
+
+class MicState:
+    """Bookkeeping for one open microphone session.
+
+    The clock counts the audio that came through the microphone rather than
+    wall time, so the silence timer measures real silence.
+    """
+
+    def __init__(self) -> None:
+        self.clock = 0.0
+        self.level_count = 0
+        self.last_level_at = 0.0
+        self.speech_seen = False
+        self.silence_since: float | None = None
+
+
+def _chunk_level(chunk: bytes) -> float:
+    """The RMS of an int16 chunk, normalised to 0..1 for the orb."""
+    frames = len(chunk) // 2
+    if frames <= 0:
+        return 0.0
+    samples = array.array("h")
+    samples.frombytes(chunk[: frames * 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    total = 0
+    for value in samples:
+        total += value * value
+    return min(1.0, math.sqrt(total / frames) / FULL_SCALE_RMS)
+
+
+def resolve_voice_id(text: str, preset: str = "auto") -> str:
+    """The voice id that should speak this line.
+
+    An explicitly chosen preset always wins.  The default `auto` preset speaks
+    English with the lively Indian English voice and Devanagari with the Hindi
+    voice, so the orb sounds natural without any configuration.
+    """
+    chosen = pick_voice(text, preset)
+    if chosen is None:
+        return PLAIN_ENGLISH_VOICE_ID
+    if voice_for(preset) is None and chosen.voice_id == PLAIN_ENGLISH_VOICE_ID:
+        lively = voice_for("en_lively")
+        if lively is not None:
+            return lively.voice_id
+    return chosen.voice_id
 
 
 class _BrainShim:
@@ -240,12 +307,13 @@ class BrainSession:
         return {
             "type": "ready",
             "voice_ready": True,
+            "voice_id": resolve_voice_id("", self.voice_preset),
             "key_found": bool(self.key),
             "config_error": self.config_error,
         }
 
     def _cmd_shutdown(self, _command: dict[str, Any]) -> dict[str, Any]:
-        self._mic_stop.set()
+        self._stop_mic()
         stop()
         return {"type": "ok"}
 
@@ -379,8 +447,7 @@ class BrainSession:
             payload["actions"].append(action)
             payload["descriptions"].append(_describe_action(action))
         if speak and spoken and TTS_AVAILABLE:
-            voice = pick_voice(spoken, self.voice_preset)
-            voice_id = voice.voice_id if voice else "en-IN-NeerjaNeural"
+            voice_id = resolve_voice_id(spoken, self.voice_preset)
             try:
                 tts_result = tts_synthesize(spoken, voice_id)
                 payload["speech"] = tts_result.get("text", spoken)
@@ -432,12 +499,49 @@ class BrainSession:
             self._mic_thread = threading.Thread(target=self._mic_loop, daemon=True)
             self._mic_thread.start()
             return {"type": "ok"}
+        self._stop_mic()
+        return {"type": "ok"}
+
+    def _stop_mic(self) -> None:
+        """Close the microphone.  Safe to call when it was never opened."""
         self._mic_stop.set()
         thread = self._mic_thread
         self._mic_thread = None
-        if thread is not None:
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5)
-        return {"type": "ok"}
+
+    def _mic_chunk(self, chunk: bytes, recognizer: Any, state: MicState) -> bool:
+        """Handle one microphone chunk.
+
+        Returns False once somebody spoke and then went quiet for long enough,
+        so the loop can close itself without another click.
+        """
+        state.clock += (len(chunk) // 2) / float(MIC_SAMPLE_RATE)
+        level = _chunk_level(chunk)
+        if state.level_count == 0 or state.clock - state.last_level_at >= LEVEL_INTERVAL:
+            state.level_count += 1
+            state.last_level_at = state.clock
+            self._emit({"type": "level", "value": round(level, 3)})
+        if level >= SPEECH_LEVEL:
+            state.speech_seen = True
+            state.silence_since = None
+        if recognizer.AcceptWaveform(chunk):
+            result = json.loads(recognizer.Result())
+            text = result.get("text", "").strip()
+            if text:
+                state.speech_seen = True
+                state.silence_since = None
+                self._emit({"type": "transcript", "text": text, "final": False})
+        if not state.speech_seen:
+            # A quiet room must never close the microphone on its own.
+            return True
+        if level > SILENCE_LEVEL:
+            state.silence_since = None
+            return True
+        if state.silence_since is None:
+            state.silence_since = state.clock
+            return True
+        return state.clock - state.silence_since < SILENCE_SECONDS
 
     def _mic_loop(self) -> None:
         import sounddevice as sd
@@ -447,8 +551,9 @@ class BrainSession:
         if not model_path.exists():
             self._emit({"type": "error", "message": "the offline voice model is missing"})
             return
-        recognizer = KaldiRecognizer(Model(str(model_path)), 16000)
+        recognizer = KaldiRecognizer(Model(str(model_path)), MIC_SAMPLE_RATE)
         audio_q: queue.Queue[bytes] = queue.Queue()
+        state = MicState()
 
         def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
             if not status:
@@ -456,8 +561,8 @@ class BrainSession:
 
         try:
             with sd.RawInputStream(
-                samplerate=16000,
-                blocksize=8000,
+                samplerate=MIC_SAMPLE_RATE,
+                blocksize=MIC_BLOCK_FRAMES,
                 dtype="int16",
                 channels=1,
                 callback=callback,
@@ -467,18 +572,23 @@ class BrainSession:
                         chunk = audio_q.get(timeout=0.5)
                     except queue.Empty:
                         continue
-                    if recognizer.AcceptWaveform(chunk):
-                        result = json.loads(recognizer.Result())
-                        text = result.get("text", "").strip()
-                        if text:
-                            self._emit({"type": "transcript", "text": text, "final": False})
+                    if not self._mic_chunk(chunk, recognizer, state):
+                        # The user stopped talking, so the microphone closes
+                        # itself and the orb can think and answer.
+                        self._mic_stop.set()
+                        break
         except Exception as error:  # noqa: BLE001
             self._emit({"type": "error", "message": f"microphone error: {type(error).__name__}"})
-            return
-        final = json.loads(recognizer.FinalResult())
-        text = final.get("text", "").strip()
-        if text:
-            self._emit({"type": "transcript", "text": text, "final": True})
+        else:
+            final = json.loads(recognizer.FinalResult())
+            text = final.get("text", "").strip()
+            if text:
+                self._emit({"type": "transcript", "text": text, "final": True})
+        finally:
+            # The orb settles back down and the shell learns the mic is closed,
+            # even when nobody said anything.
+            self._emit({"type": "level", "value": 0.0})
+            self._emit({"type": "mic_state", "state": "idle"})
 
     # -- usage -------------------------------------------------------------
 

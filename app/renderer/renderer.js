@@ -1,68 +1,71 @@
 'use strict';
 
+// The whole face of Rasgulla: the name, three phases and the orb.
+// Click the orb to open the microphone; the orb reacts to the level, the
+// phase follows the work, and the spoken line is captioned on the orb.
+
 const rasgulla = window.rasgulla;
 const orb = document.getElementById('orb');
 const audio = document.getElementById('voice');
-const entry = document.getElementById('entry');
-const btnSend = document.getElementById('btnSend');
-const btnPin = document.getElementById('btnPin');
-const btnCollapse = document.getElementById('btnCollapse');
 const btnClose = document.getElementById('btnClose');
-const transcript = document.getElementById('transcript');
-const planCard = document.getElementById('plan-card');
-const planList = document.getElementById('plan-list');
-const btnRunPlan = document.getElementById('btnRunPlan');
-const btnClearPlan = document.getElementById('btnClearPlan');
-const confirmCard = document.getElementById('confirm-card');
-const confirmText = document.getElementById('confirm-text');
-const btnConfirmYes = document.getElementById('btnConfirmYes');
-const btnConfirmNo = document.getElementById('btnConfirmNo');
-const routeCaption = document.getElementById('route-caption');
 
-let pendingConfirm = null;
 let voiceUrl = null;
+let micOpen = false;
+let phase = 'listening';
 
-function escapeHtml(text) {
-  return String(text).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;',
-  }[c]));
-}
-
-function appendTranscript(speaker, message, tag = 'speaker') {
-  const div = document.createElement('div');
-  div.className = tag;
-  div.innerHTML = `<span class="speaker">${escapeHtml(speaker)}:</span> ${escapeHtml(message)}`;
-  transcript.appendChild(div);
-  transcript.scrollTop = transcript.scrollHeight;
-}
-
-function pill(state) {
+function setPhase(next) {
+  phase = next;
   for (const button of document.querySelectorAll('.pill button')) {
-    button.setAttribute('aria-pressed', button.dataset.state === state ? 'true' : 'false');
+    button.setAttribute('aria-pressed', button.dataset.state === next ? 'true' : 'false');
   }
-  // The pet overlay follows the orb: idle frames while resting, work frames
-  // while a request is in flight.
-  if (typeof rasgulla.setOrbState === 'function') {
-    rasgulla.setOrbState(state);
+  if (next !== 'speaking') {
+    // The orb drives itself while it speaks, so only the resting states are
+    // written here.
+    orb.setAttribute('state', next);
   }
 }
 
 function setLevel(value) {
-  orb.setAttribute('level', Math.min(1, Math.max(0, Number(value) || 0)).toFixed(3));
+  const level = Math.min(1, Math.max(0, Number(value) || 0));
+  orb.setAttribute('level', level.toFixed(3));
 }
 
-// Lets the shell drive the orb state, so the pet overlay can follow it.
-window.__rasgullaSetOrbState = (state) => pill(state);
+async function setMic(on) {
+  try {
+    await rasgulla.sendToBrain({ command: 'mic', on: Boolean(on) });
+    micOpen = Boolean(on);
+  } catch (error) {
+    console.error('[mic]', error.message);
+    micOpen = false;
+    setPhase('listening');
+  }
+}
 
-function saySpoken(text, audioBase64, words, mime) {
+async function onOrbClick() {
+  if (phase === 'thinking' || phase === 'speaking') return;
+  if (micOpen) {
+    await setMic(false);
+    setPhase('listening');
+    return;
+  }
+  setPhase('listening');
+  await setMic(true);
+}
+
+function ask(text) {
+  const request = String(text || '').trim();
+  if (!request) return;
+  setPhase('thinking');
+  rasgulla.sendToBrain({ command: 'route', text: request, mode: 'auto', speak: true })
+    .catch((error) => {
+      console.error('[brain]', error.message);
+      setPhase('listening');
+    });
+}
+
+function speak(text, audioBase64, words, mime) {
   const clean = String(text || '').trim();
   if (!clean) return;
-  orb.setAttribute('state', 'speaking');
-  pill('speaking');
   if (voiceUrl) {
     URL.revokeObjectURL(voiceUrl);
     voiceUrl = null;
@@ -71,203 +74,78 @@ function saySpoken(text, audioBase64, words, mime) {
     const binary = atob(audioBase64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const blob = new Blob([bytes], { type: mime || 'audio/mpeg' });
-    voiceUrl = URL.createObjectURL(blob);
+    voiceUrl = URL.createObjectURL(new Blob([bytes], { type: mime || 'audio/mpeg' }));
     audio.src = voiceUrl;
   }
-  const lineWords = (words || []).map((w, i) => ({
-    w: w.w || (clean.split(/\s+/)[i] || ''),
-    start: Number(w.start) || 0,
-    end: Number(w.end) || 0,
+  const spoken = clean.split(/\s+/);
+  const lineWords = (words || []).map((word, index) => ({
+    w: word.w || spoken[index] || '',
+    start: Number(word.start) || 0,
+    end: Number(word.end) || 0,
   }));
-  orb.say(clean, { words: lineWords, audio });
-  if (!audioBase64) {
-    // No real audio: the orb falls back to its estimated envelope.
-    const rest = orb.getAttribute('rest') || 'listening';
-    orb.setAttribute('state', rest);
-    pill(rest);
-  } else {
-    audio.addEventListener('ended', () => {
-      const rest = orb.getAttribute('rest') || 'listening';
-      orb.setAttribute('state', rest);
-      pill(rest);
-    }, { once: true });
+  if (audioBase64) {
+    setPhase('speaking');
+    // The audio element is handed over, so the orb follows the real voice.
+    orb.say(clean, { words: lineWords, audio });
+    return;
   }
+  if (!lineWords.length) return;
+  setPhase('speaking');
+  // No audio, but the timings are known: the caption still runs on the real
+  // clock.  The browser speech voice is never used.
+  orb.say(clean, { words: lineWords });
 }
 
-async function handleMessage(message) {
-  const route = message.route || {};
-  const descriptions = Array.isArray(message.descriptions) ? message.descriptions : [];
-  const rejections = Array.isArray(message.rejections) ? message.rejections : [];
+function handleMessage(message) {
   switch (message.type) {
     case 'ready':
-      pill('listening');
+      setPhase('listening');
       setLevel(0);
-      appendTranscript(
-        'System',
-        `Orb ready. ${message.key_found ? 'Assistant key found.' : 'No assistant key found. Set RASGULLA_API_KEY and restart.'}`,
-        'note'
-      );
-      break;
-    case 'state':
-      pill(message.state);
       break;
     case 'level':
       setLevel(message.value);
       break;
+    case 'mic_state':
+      micOpen = message.state === 'live';
+      break;
     case 'transcript':
-      appendTranscript('You', message.text, 'me');
       if (message.final) {
-        pill('thinking');
-        rasgulla.sendToBrain({ command: 'route', text: message.text, mode: 'auto', speak: true });
+        micOpen = false;
+        ask(message.text);
       }
       break;
     case 'plan':
-      appendTranscript('Rasgulla', message.reply);
-      routeCaption.textContent = `Route: ${route.tier_label || route.tier || '-'} / ${route.label || '-'} - ${route.seconds || 0}s - ${route.tokens || 0} tokens`;
-      if (message.warning) appendTranscript('Rasgulla', message.warning, 'note');
-      if (message.clarify) appendTranscript('Rasgulla', message.clarify, 'note');
-      if (message.speech) {
-        saySpoken(message.speech, message.audio, message.words, message.mime);
-      }
-      if (message.actions && message.actions.length) {
-        planCard.classList.remove('hidden');
-        planList.innerHTML = '';
-        for (const [index, action] of message.actions.entries()) {
-          const row = document.createElement('div');
-          row.className = 'plan-row';
-          const checkbox = document.createElement('input');
-          checkbox.type = 'checkbox';
-          checkbox.value = index;
-          checkbox.addEventListener('change', () => {
-            const approved = Array.from(planList.querySelectorAll('input:checked')).map((el) => Number(el.value));
-            btnRunPlan.disabled = approved.length === 0;
-          });
-          const desc = document.createElement('span');
-          desc.className = 'desc';
-          desc.textContent = `${index + 1}. ${descriptions[index] || ''}`;
-          row.appendChild(checkbox);
-          row.appendChild(desc);
-          if (rejections.includes(descriptions[index] || '')) {
-            const badge = document.createElement('span');
-            badge.className = 'rejected';
-            badge.textContent = 'rejected';
-            row.appendChild(badge);
-          }
-          planList.appendChild(row);
-        }
-      } else {
-        planCard.classList.add('hidden');
-      }
-      break;
-    case 'confirm':
-      pendingConfirm = { index: message.index };
-      confirmText.textContent = `Run: ${message.description}?`;
-      confirmCard.classList.remove('hidden');
-      break;
-    case 'action_result':
-      appendTranscript('Rasgulla', message.text, 'note');
-      confirmCard.classList.add('hidden');
-      pendingConfirm = null;
-      break;
-    case 'plan_done':
-      confirmCard.classList.add('hidden');
-      pendingConfirm = null;
-      pill('listening');
+      speak(message.speech, message.audio, message.words, message.mime);
       break;
     case 'error':
-      appendTranscript('Rasgulla', message.message, 'note');
+      console.error('[brain]', message.message);
+      setPhase('listening');
       break;
     case 'brain_down':
-      appendTranscript('System', 'Brain process stopped.', 'note');
+      console.error('[brain] the brain stopped');
+      micOpen = false;
+      setPhase('listening');
       break;
   }
 }
 
-rasgulla.onBrainEvent(handleMessage);
-rasgulla.onBrainLog((log) => {
-  console.log('[brain]', log.message);
-});
-
-btnSend.addEventListener('click', async () => {
-  const text = entry.value.trim();
-  if (!text) return;
-  entry.value = '';
-  appendTranscript('You', text, 'me');
-  pill('thinking');
-  try {
-    await rasgulla.sendToBrain({ command: 'route', text, mode: 'auto', speak: true });
-  } catch (error) {
-    appendTranscript('System', `The brain did not answer: ${error.message}`, 'note');
-    pill('listening');
-  }
-});
-
-btnPin.addEventListener('click', async () => {
-  const result = await rasgulla.togglePin();
-  btnPin.textContent = result.pinned ? 'unpin' : 'pin';
-});
+orb.addEventListener('click', onOrbClick);
+orb.addEventListener('end', () => setPhase('listening'));
+audio.addEventListener('ended', () => setPhase('listening'));
 
 btnClose.addEventListener('click', () => {
   rasgulla.sendToBrain({ command: 'shutdown' }).catch(() => {});
   window.close();
 });
 
-btnRunPlan.addEventListener('click', async () => {
-  const approved = Array.from(planList.querySelectorAll('input:checked')).map((el) => Number(el.value));
-  if (approved.length === 0) return;
-  planCard.classList.add('hidden');
-  await rasgulla.sendToBrain({ command: 'run_plan', approved });
+rasgulla.onBrainEvent(handleMessage);
+rasgulla.onBrainLog((log) => {
+  console.log('[brain]', log.message);
 });
 
-btnClearPlan.addEventListener('click', () => {
-  planCard.classList.add('hidden');
-  planList.innerHTML = '';
-  btnRunPlan.disabled = true;
-});
-
-btnConfirmYes.addEventListener('click', async () => {
-  if (pendingConfirm == null) return;
-  confirmCard.classList.add('hidden');
-  await rasgulla.sendToBrain({ command: 'act', index: pendingConfirm.index, ok: true });
-  pendingConfirm = null;
-});
-
-btnConfirmNo.addEventListener('click', () => {
-  if (pendingConfirm == null) return;
-  confirmCard.classList.add('hidden');
-  rasgulla.sendToBrain({ command: 'act', index: pendingConfirm.index, ok: false }).catch(() => {});
-  pendingConfirm = null;
-});
-
-entry.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') btnSend.click();
-});
-
-// -- layout -------------------------------------------------------------------
-
-function applyLayout(isExpanded) {
-  const expanded = Boolean(isExpanded);
-  document.body.classList.toggle('expanded', expanded);
-  panel.classList.toggle('hidden', !expanded);
-  btnCollapse.textContent = expanded ? 'collapse' : 'expand';
-  btnCollapse.title = expanded ? 'Collapse the chat panel' : 'Expand the chat panel';
-}
-
-btnCollapse.addEventListener('click', async () => {
-  try {
-    const result = await rasgulla.toggleExpand();
-    applyLayout(result && result.expanded);
-  } catch (error) {
-    appendTranscript('System', `The window could not be resized: ${error.message}`, 'note');
-  }
-});
-
-rasgulla.onLayout((state) => {
-  applyLayout(state && state.expanded);
-});
-
-applyLayout(false);
+// Test hooks: the acceptance test drives the app through these.
+window.__rasgullaAsk = (text) => ask(text);
+window.__rasgullaGetPhase = () => phase;
 
 rasgulla.sendToBrain({ command: 'hello' }).catch(() => {});
 

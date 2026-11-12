@@ -1,9 +1,9 @@
 """Live acceptance test: drive the real app and watch the orb speak.
 
-This is the end-to-end check from the design spec: a question is typed into
-the real window, the real brain answers through the real router, the voice
-engine speaks the character line, and the orb has to put captions on screen
-while the audio plays.
+This is the end-to-end check from the design spec: a question is handed to the
+real window, the real brain answers through the real router, the voice engine
+speaks the character line, and the orb has to put captions on screen while the
+audio plays.
 
 It needs a working assistant key (the brain finds one in the environment or in
 the Windows user registry) and it uses the free endpoint, so it runs inside
@@ -99,12 +99,19 @@ def main() -> int:
     print("-" * 16)
 
     state = live.get("state", {})
-    check("the reply reached the transcript", int(state.get("transcriptChildren", 0)) >= 2, str(state))
     check("the audio element holds a blob", state.get("audioIsBlob") is True, str(state))
     check("the audio actually played", live.get("audioEverPlayed") is True, str(live))
     caption = str(live.get("captionText", ""))
     check("the orb showed a caption", len(caption.strip()) > 0, repr(caption))
     check("the caption holds real words", len(caption.split()) >= 1, repr(caption))
+    check(
+        "the screen shows the name and three phases only",
+        state.get("brandText") == "Rasgulla"
+        and state.get("phaseCount") == 3
+        and state.get("hasInput") is False
+        and state.get("hasPanel") is False,
+        str(state),
+    )
     check("the app exited cleanly", returncode == 0, f"exit={returncode}")
 
     print("=" * 16)

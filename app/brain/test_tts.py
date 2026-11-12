@@ -45,12 +45,19 @@ def wav_bytes(seconds: float = 0.25, rate: int = 24000) -> bytes:
     return buffer.getvalue()
 
 
+COMMUNICATE_CALLS: list[dict] = []
+
+
 class FakeCommunicate:
     """Stands in for edge_tts.Communicate: yields boundaries then audio."""
 
-    def __init__(self, text, voice_id, boundary=None):
+    def __init__(self, text, voice_id, boundary=None, **kwargs):
         self.text = text
         self.voice_id = voice_id
+        self.kwargs = kwargs
+        COMMUNICATE_CALLS.append(
+            {"text": text, "voice_id": voice_id, "boundary": boundary, **kwargs}
+        )
 
     async def stream(self):
         yield {"type": "WordBoundary", "text": "hello", "offset": 0, "duration": 5000000}
@@ -61,7 +68,7 @@ class FakeCommunicate:
 class BrokenCommunicate:
     """Stands in for a neural backend that cannot be reached."""
 
-    def __init__(self, text, voice_id, boundary=None):
+    def __init__(self, text, voice_id, boundary=None, **kwargs):
         pass
 
     async def stream(self):
@@ -131,12 +138,117 @@ def test_empty_text_is_silent():
     check("empty text has no words", result.get("words") == [], str(result))
 
 
+def test_neural_path_sends_the_preset_prosody():
+    original_communicate = tts.edge_tts.Communicate
+    original_wav = tts.synthesize_wav
+    COMMUNICATE_CALLS.clear()
+    tts.edge_tts.Communicate = FakeCommunicate
+    tts.synthesize_wav = lambda text, voice: wav_bytes()
+    try:
+        tts.synthesize("hello world", "en-IN-NeerjaExpressiveNeural")
+    finally:
+        tts.edge_tts.Communicate = original_communicate
+        tts.synthesize_wav = original_wav
+
+    check("one speech request was made", len(COMMUNICATE_CALLS) == 1, str(COMMUNICATE_CALLS))
+    call = COMMUNICATE_CALLS[0] if COMMUNICATE_CALLS else {}
+    check("the requested voice is used", call.get("voice_id") == "en-IN-NeerjaExpressiveNeural", str(call))
+    check("the lively rate is passed on", call.get("rate") == "+2%", str(call))
+    check("the lively pitch is passed on", call.get("pitch") == "+8Hz", str(call))
+    check("the volume is passed on", call.get("volume") == "+0%", str(call))
+    check("word boundaries are still asked for", call.get("boundary") == "WordBoundary", str(call))
+
+
+def test_prosody_follows_the_preset_that_owns_the_voice():
+    expected = {
+        "en-IN-NeerjaNeural": ("+6%", "+4Hz"),
+        "en-IN-NeerjaExpressiveNeural": ("+2%", "+8Hz"),
+        "hi-IN-SwaraNeural": ("+4%", "+4Hz"),
+    }
+    original_communicate = tts.edge_tts.Communicate
+    original_wav = tts.synthesize_wav
+    tts.edge_tts.Communicate = FakeCommunicate
+    tts.synthesize_wav = lambda text, voice: wav_bytes()
+    try:
+        for voice_id, (rate, pitch) in expected.items():
+            COMMUNICATE_CALLS.clear()
+            tts.synthesize("hello world", voice_id)
+            call = COMMUNICATE_CALLS[0] if COMMUNICATE_CALLS else {}
+            check(
+                f"{voice_id} keeps its own rate",
+                call.get("rate") == rate,
+                str(call),
+            )
+            check(
+                f"{voice_id} keeps its own pitch",
+                call.get("pitch") == pitch,
+                str(call),
+            )
+    finally:
+        tts.edge_tts.Communicate = original_communicate
+        tts.synthesize_wav = original_wav
+
+
+def test_fallback_uses_the_same_prosody_as_the_neural_path():
+    original_communicate = tts.edge_tts.Communicate
+    original_wav = tts.synthesize_wav
+    seen: list[object] = []
+
+    def fake_wav(text, voice):
+        seen.append(voice)
+        return wav_bytes()
+
+    tts.edge_tts.Communicate = BrokenCommunicate
+    tts.synthesize_wav = fake_wav
+    try:
+        tts.synthesize("hello world", "en-IN-NeerjaExpressiveNeural")
+    finally:
+        tts.edge_tts.Communicate = original_communicate
+        tts.synthesize_wav = original_wav
+
+    check("the fallback got a voice", len(seen) == 1 and seen[0] is not None, str(seen))
+    if seen and seen[0] is not None:
+        check(
+            "the fallback uses the same rate",
+            getattr(seen[0], "rate", "") == "+2%",
+            str(getattr(seen[0], "rate", "")),
+        )
+        check(
+            "the fallback uses the same pitch",
+            getattr(seen[0], "pitch", "") == "+8Hz",
+            str(getattr(seen[0], "pitch", "")),
+        )
+        check(
+            "the fallback uses the same voice",
+            getattr(seen[0], "voice_id", "") == "en-IN-NeerjaExpressiveNeural",
+            str(getattr(seen[0], "voice_id", "")),
+        )
+
+
+def test_unknown_voice_id_resolves_without_crashing():
+    try:
+        voice = tts._voice_for_id("no-such-voice")
+    except Exception as error:  # noqa: BLE001 - the point of the test
+        check("an unknown voice id does not crash", False, f"{type(error).__name__}: {error}")
+        return
+    check("an unknown voice id still resolves", voice is not None, str(voice))
+    check(
+        "an unknown voice id falls back to indian english",
+        getattr(voice, "voice_id", "") == "en-IN-NeerjaNeural",
+        str(getattr(voice, "voice_id", "")),
+    )
+
+
 def main():
     print("Brain TTS tests")
     print("=" * 16)
     test_mp3_path_returns_audio_and_word_timings()
     test_fallback_returns_a_complete_wav_file()
     test_empty_text_is_silent()
+    test_neural_path_sends_the_preset_prosody()
+    test_prosody_follows_the_preset_that_owns_the_voice()
+    test_fallback_uses_the_same_prosody_as_the_neural_path()
+    test_unknown_voice_id_resolves_without_crashing()
     print("=" * 16)
     print(f"passed: {PASSED}   failed: {len(FAILED)}")
     for failure in FAILED:

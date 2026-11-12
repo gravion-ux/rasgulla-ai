@@ -22,7 +22,7 @@ def synthesize(text: str, voice_id: str | None = None) -> dict[str, Any]:
     """Synthesise one spoken line; return mp3 bytes and per-word timings."""
     if not text:
         return {"audio": "", "mime": "audio/mpeg", "words": [], "text": ""}
-    voice_id = voice_id or "en-IN-NeerjaNeural"
+    voice_id = voice_id or "en-IN-NeerjaExpressiveNeural"
     try:
         audio, words = asyncio.run(_stream(text, voice_id))
     except Exception:  # noqa: BLE001 - fall back to the local engine
@@ -62,11 +62,19 @@ def _fallback(text: str, voice_id: str) -> dict[str, Any]:
 
 
 def _voice_for_id(voice_id: str):
-    """Find the preset that owns this voice id, or fall back to Indian English."""
-    for voice in VOICES:
-        if voice.voice_id and voice.voice_id == voice_id:
-            return voice
-    return voice_for(voice_id) or voice_for("en")
+    """The preset that owns this voice id, so its prosody can be reused.
+
+    An id nobody owns still resolves to Indian English: an unknown voice must
+    never take the whole speech path down.
+    """
+    try:
+        for voice in VOICES:
+            if voice.voice_id and voice.voice_id == voice_id:
+                return voice
+        fallback = voice_for(voice_id)
+    except Exception:  # noqa: BLE001 - an unknown id must not crash the speech
+        fallback = None
+    return fallback or voice_for("en")
 
 
 def _wav_seconds(audio: bytes) -> float:
@@ -82,7 +90,17 @@ def _wav_seconds(audio: bytes) -> float:
 
 
 async def _stream(text: str, voice_id: str) -> tuple[bytes, list[dict[str, Any]]]:
-    communicate = edge_tts.Communicate(text, voice_id, boundary="WordBoundary")
+    voice = _voice_for_id(voice_id)
+    # The prosody belongs to the preset that owns the voice, so the neural path
+    # and the local fallback sound the same.
+    communicate = edge_tts.Communicate(
+        text,
+        voice_id,
+        rate=voice.rate,
+        pitch=voice.pitch,
+        volume=voice.volume,
+        boundary="WordBoundary",
+    )
     audio = bytearray()
     words: list[dict[str, Any]] = []
     async for chunk in communicate.stream():

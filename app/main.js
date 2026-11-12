@@ -1,11 +1,10 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, shell, protocol, net, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, protocol, net } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const { pathToFileURL } = require('url');
 
-const { isAllowedExternalUrl } = require('./lib/url-guard');
 const { resolveVendorPath } = require('./lib/vendor-paths');
 const { WINDOW_SIZES } = require('./lib/layout');
 
@@ -15,16 +14,15 @@ const VENV_PYTHON = path.join(PROJECT_ROOT, '.venv', 'Scripts', 'python.exe');
 const BRAIN_ENTRY = path.join(APP_DIR, 'brain', 'brain.py');
 const PROBE_MODE = process.argv.includes('--probe');
 const LIVE_PROBE_MODE = process.argv.includes('--probe-live');
+const SHOT_MODE = process.argv.includes('--probe-shot');
 
 let orbWindow = null;
-let petWindow = null;
 let brainProcess = null;
 let brainRestarts = 0;
 let shuttingDown = false;
-let expanded = false;
 let pendingId = 0;
 const pending = new Map();
-const served = { orbScript: false, petFrame: false };
+const served = { orbScript: false };
 
 // The scheme has to be declared before the app is ready.  It is deliberately
 // not a "standard" scheme, so Chromium hands the request over as the exact
@@ -70,7 +68,6 @@ function registerVendorProtocol() {
     }
     const file = resolved.file;
     if (file.endsWith('speaking-orb.js')) served.orbScript = true;
-    if (file.includes(`${path.sep}pet-frames${path.sep}`)) served.petFrame = true;
     try {
       const response = await net.fetch(pathToFileURL(file).toString());
       const body = await response.arrayBuffer();
@@ -122,7 +119,7 @@ function spawnBrain() {
         resolver.resolve(message);
       }
       // Every message from the brain also reaches the renderer, which is the
-      // UI channel for plans, transcripts and levels.
+      // UI channel for transcripts, levels and plans.
       if (orbWindow && orbWindow.webContents) {
         orbWindow.webContents.send('brain:event', message);
       }
@@ -208,35 +205,6 @@ function createOrbWindow() {
   });
 }
 
-function createPetWindow() {
-  petWindow = new BrowserWindow({
-    width: 200,
-    height: 240,
-    show: false,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    resizable: false,
-    backgroundColor: '#00000000',
-    webPreferences: {
-      preload: path.join(APP_DIR, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  });
-  petWindow.loadFile(path.join(APP_DIR, 'renderer', 'pet.html'));
-  petWindow.once('ready-to-show', () => {
-    petWindow.show();
-    const display = screen.getPrimaryDisplay().workAreaSize;
-    petWindow.setPosition(display.width - 240, display.height - 280);
-  });
-  petWindow.on('closed', () => {
-    petWindow = null;
-  });
-}
-
 function stopBrain() {
   shuttingDown = true;
   if (brainProcess) {
@@ -245,28 +213,16 @@ function stopBrain() {
   }
 }
 
-function setExpanded(next) {
-  expanded = Boolean(next);
-  const size = expanded ? WINDOW_SIZES.expanded : WINDOW_SIZES.compact;
-  if (orbWindow) {
-    // The content size is what the spec describes.  Windows adds a one pixel
-    // invisible border around a frameless window, so the outer size is always
-    // a touch larger.
-    orbWindow.setContentSize(size.width, size.height);
-    orbWindow.webContents.send('window:layout', { expanded });
-  }
-  return { expanded };
-}
-
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 app.whenReady().then(async () => {
   registerVendorProtocol();
   spawnBrain();
   createOrbWindow();
-  createPetWindow();
   if (LIVE_PROBE_MODE) {
     await runLiveProbe();
+  } else if (SHOT_MODE) {
+    await runShotProbe();
   } else if (PROBE_MODE) {
     await runProbe();
   }
@@ -287,102 +243,29 @@ ipcMain.handle('brain:send', async (_event, payload) => {
   return sendToBrain(payload);
 });
 
-ipcMain.handle('brain:spawn', () => {
-  spawnBrain();
-  return { ok: true };
-});
-
-ipcMain.handle('shell:open', async (_event, url) => {
-  if (!isAllowedExternalUrl(url)) {
-    return { ok: false };
-  }
-  await shell.openExternal(url);
-  return { ok: true };
-});
-
-ipcMain.handle('window:toggle-pin', (_event) => {
-  if (!orbWindow) return { pinned: false };
-  const next = !orbWindow.isAlwaysOnTop();
-  orbWindow.setAlwaysOnTop(next);
-  return { pinned: next };
-});
-
-ipcMain.handle('window:toggle-expand', (_event) => {
-  return setExpanded(!expanded);
-});
-
-ipcMain.handle('window:show-pet', (_event) => {
-  if (petWindow) petWindow.show();
-  return { ok: true };
-});
-
-ipcMain.handle('window:hide-pet', (_event) => {
-  if (petWindow) petWindow.hide();
-  return { ok: true };
-});
-
-ipcMain.handle('pet:move', (_event, { dx, dy } = {}) => {
-  if (!petWindow) return { ok: false };
-  const [x, y] = petWindow.getPosition();
-  const stepX = Number(dx) || 0;
-  const stepY = Number(dy) || 0;
-  petWindow.setPosition(x + stepX, y + stepY);
-  return { ok: true };
-});
-
-ipcMain.handle('orb:focus', (_event) => {
-  if (orbWindow) {
-    orbWindow.show();
-    orbWindow.focus();
-  }
-  return { ok: true };
-});
-
-ipcMain.on('orb:state', (_event, state) => {
-  if (petWindow && petWindow.webContents) {
-    petWindow.webContents.send('pet:state', { state: String(state || '') });
-  }
-});
-
 // -- probe mode ---------------------------------------------------------------
 //
-// `electron . --probe` runs the real app, looks inside both renderers and
+// `electron . --probe` runs the real app, looks inside the renderer and
 // prints one JSON line.  The smoke test asserts on that line, so a broken
 // window or a dead renderer can no longer pass as a healthy app.
 
 const ORB_PROBE = `(() => {
   const orb = document.getElementById("orb");
-  const panel = document.getElementById("panel");
+  const brand = document.getElementById("brand");
+  const phases = document.querySelectorAll(".pill button");
   return {
     elementDefined: Boolean(customElements.get("speaking-orb")),
     rendererRan: window.__rasgullaRendererReady === true,
-    panelHiddenAtStart: Boolean(panel && panel.classList.contains("hidden")),
-    panelDisplay: panel ? getComputedStyle(panel).display : null,
     shadowRoot: Boolean(orb && orb.shadowRoot),
-    transcriptChildren: document.getElementById("transcript")
-      ? document.getElementById("transcript").children.length
-      : -1
-  };
-})()`;
-
-const PET_PROBE = `(() => {
-  const canvas = document.getElementById("sprite");
-  const state = window.__rasgullaPet || {};
-  let painted = 0;
-  try {
-    const context = canvas.getContext("2d");
-    const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
-    for (let i = 3; i < data.length; i += 4) {
-      if (data[i] > 0) painted += 1;
-    }
-  } catch (error) {
-    painted = -1;
-  }
-  return {
-    framesLoaded: state.framesLoaded || 0,
-    frameErrors: state.frameErrors || 0,
-    setName: state.setName || null,
-    canvasNonTransparentPixels: painted
+    brandText: brand ? brand.textContent.trim() : null,
+    phaseCount: phases.length,
+    phaseLabels: Array.from(phases).map((button) => button.textContent.trim()),
+    hasInput: Boolean(document.getElementById("entry")),
+    hasPanel: Boolean(document.getElementById("panel")),
+    hasStrip: Boolean(document.querySelector(".strip")),
+    hasPlanCard: Boolean(document.getElementById("plan-card")),
+    hasConfirmCard: Boolean(document.getElementById("confirm-card")),
+    orbCursor: orb ? getComputedStyle(orb).cursor : null
   };
 })()`;
 
@@ -404,19 +287,18 @@ const LIVE_PROBE = `(() => {
   const orb = document.getElementById("orb");
   const cap = orb && orb.shadowRoot ? orb.shadowRoot.querySelector(".cap") : null;
   const audio = document.getElementById("voice");
-  const transcript = document.getElementById("transcript");
+  const brand = document.getElementById("brand");
+  const phases = document.querySelectorAll(".pill button");
   return {
     captionText: cap ? cap.textContent : null,
     orbState: orb ? orb.getAttribute("state") : null,
     audioIsBlob: audio ? audio.src.startsWith("blob:") : false,
     audioPaused: audio ? audio.paused : null,
     audioDuration: audio ? audio.duration : null,
-    transcriptChildren: transcript ? transcript.children.length : -1,
-    lastLine: transcript && transcript.lastElementChild
-      ? transcript.lastElementChild.textContent : null,
-    panelHidden: document.getElementById("panel")
-      ? document.getElementById("panel").classList.contains("hidden")
-      : null
+    brandText: brand ? brand.textContent.trim() : null,
+    phaseCount: phases.length,
+    hasInput: Boolean(document.getElementById("entry")),
+    hasPanel: Boolean(document.getElementById("panel"))
   };
 })()`;
 
@@ -425,9 +307,7 @@ async function runLiveProbe() {
   await waitForLoad(orbWindow);
   await sleep(2500);
   await orbWindow.webContents.executeJavaScript(`(() => {
-    const entry = document.getElementById("entry");
-    entry.value = "In one short sentence, what is a desk companion?";
-    document.getElementById("btnSend").click();
+    window.__rasgullaAsk("In one short sentence, what is a desk companion?");
     return true;
   })()`);
 
@@ -448,7 +328,6 @@ async function runLiveProbe() {
   const live = {
     ok: Boolean(
       state &&
-      state.transcriptChildren >= 2 &&
       audioEverPlayed &&
       state.audioIsBlob &&
       captionSeen.length > 0
@@ -462,64 +341,65 @@ async function runLiveProbe() {
   app.exit(live.ok ? 0 : 1);
 }
 
+async function runShotProbe() {
+  // A picture of the real face, for the record.
+  await waitForLoad(orbWindow);
+  await sleep(3000);
+  const shotIndex = process.argv.indexOf('--shot');
+  const target = shotIndex > 0 && process.argv[shotIndex + 1]
+    ? process.argv[shotIndex + 1]
+    : path.join(process.cwd(), 'rasgulla-orb.png');
+  const image = await orbWindow.webContents.capturePage();
+  require('fs').writeFileSync(target, image.toPNG());
+  console.log(`RASGULLA_SHOT ${target}`);
+  const layout = await orbWindow.webContents.executeJavaScript(`(() => {
+    const pick = (selector) => {
+      const el = document.querySelector(selector);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+    };
+    const orb = document.getElementById("orb");
+    let painted = 0;
+    try {
+      const canvas = orb.shadowRoot.querySelector(".orb canvas");
+      const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+      for (let i = 3; i < data.length; i += 4) { if (data[i] > 0) painted += 1; }
+    } catch (error) { painted = -1; }
+    return {
+      viewport: { w: innerWidth, h: innerHeight },
+      brand: pick("#brand"),
+      pill: pick(".pill"),
+      orb: pick("#orb"),
+      close: pick("#btnClose"),
+      orbPaintedPixels: painted
+    };
+  })()`);
+  console.log(`RASGULLA_SHOT_LAYOUT ${JSON.stringify(layout)}`);
+  stopBrain();
+  app.exit(0);
+}
+
 async function runProbe() {
   console.log('RASGULLA_PROBE_STEP windows');
   await waitForLoad(orbWindow);
-  await waitForLoad(petWindow);
   await sleep(3000);
   console.log('RASGULLA_PROBE_STEP loaded');
 
   const probe = {
-    windows: { orb: Boolean(orbWindow), pet: Boolean(petWindow) },
+    windows: { orb: Boolean(orbWindow), count: BrowserWindow.getAllWindows().length },
     orb: {},
-    pet: {},
     brain: {},
-    assets: { orbScript: served.orbScript, petFrame: served.petFrame },
+    assets: { orbScript: served.orbScript },
     layout: {},
   };
 
   if (orbWindow) {
     probe.orb = await orbWindow.webContents.executeJavaScript(ORB_PROBE);
-    const before = orbWindow.getSize();
     const contentBefore = orbWindow.getContentSize();
-    setExpanded(true);
-    await sleep(700);
-    const after = orbWindow.getSize();
-    const contentAfter = orbWindow.getContentSize();
-    const panelVisible = await orbWindow.webContents.executeJavaScript(
-      '(() => { const p = document.getElementById("panel"); return p ? getComputedStyle(p).display : null; })()'
-    );
-    setExpanded(false);
-    await sleep(400);
     probe.layout = {
-      before: { width: before[0], height: before[1] },
-      after: { width: after[0], height: after[1] },
       contentBefore: { width: contentBefore[0], height: contentBefore[1] },
-      contentAfter: { width: contentAfter[0], height: contentAfter[1] },
-      panelDisplayWhenExpanded: panelVisible,
     };
-  }
-
-  if (petWindow) {
-    probe.pet = await petWindow.webContents.executeJavaScript(PET_PROBE);
-  }
-
-  // The orb state drives the pet: a busy orb has to switch the overlay to
-  // the work frames, not keep playing the idle ones.
-  if (orbWindow && petWindow) {
-    await orbWindow.webContents.executeJavaScript(
-      'window.__rasgullaSetOrbState("thinking")'
-    );
-    await sleep(3000);
-    const busyPet = await petWindow.webContents.executeJavaScript(PET_PROBE);
-    probe.petStateSwitch = {
-      setName: busyPet.setName,
-      framesLoaded: busyPet.framesLoaded,
-      frameErrors: busyPet.frameErrors,
-    };
-    await orbWindow.webContents.executeJavaScript(
-      'window.__rasgullaSetOrbState("listening")'
-    );
   }
 
   console.log('RASGULLA_PROBE_STEP brain');
@@ -530,6 +410,7 @@ async function runProbe() {
       type: reply.type || null,
       configError: reply.config_error || '',
       keyFound: Boolean(reply.key_found),
+      voiceId: reply.voice_id || null,
     };
   } catch (error) {
     probe.brain = {
@@ -537,32 +418,44 @@ async function runProbe() {
       type: null,
       configError: String((error && error.message) || error),
       keyFound: false,
+      voiceId: null,
     };
+  }
+
+  // The orb talks by opening the microphone, so that command has to work.
+  try {
+    const opened = await sendToBrain({ command: 'mic', on: true });
+    const closed = await sendToBrain({ command: 'mic', on: false });
+    probe.brain.micAccepted = opened.type === 'ok' && closed.type === 'ok';
+  } catch (error) {
+    probe.brain.micAccepted = false;
   }
   console.log('RASGULLA_PROBE_STEP done');
 
   probe.ok = Boolean(
     probe.windows.orb &&
-    probe.windows.pet &&
+    probe.windows.count === 1 &&
     probe.orb.elementDefined &&
     probe.orb.rendererRan &&
-    probe.orb.panelHiddenAtStart &&
     probe.orb.shadowRoot &&
-    probe.pet.framesLoaded >= 12 &&
-    probe.pet.frameErrors === 0 &&
-    probe.pet.canvasNonTransparentPixels > 0 &&
+    probe.orb.brandText === 'Rasgulla' &&
+    probe.orb.phaseCount === 3 &&
+    probe.orb.phaseLabels.join(',') === 'Listening,Thinking,Speaking' &&
+    probe.orb.hasInput === false &&
+    probe.orb.hasPanel === false &&
+    probe.orb.hasStrip === false &&
+    probe.orb.hasPlanCard === false &&
+    probe.orb.hasConfirmCard === false &&
+    probe.orb.orbCursor === 'pointer' &&
     probe.brain.alive &&
     probe.brain.type === 'ready' &&
     probe.brain.configError === '' &&
+    probe.brain.voiceId === 'en-IN-NeerjaExpressiveNeural' &&
+    probe.brain.micAccepted === true &&
     probe.assets.orbScript &&
-    probe.assets.petFrame &&
-    probe.petStateSwitch &&
-    probe.petStateSwitch.setName === 'work' &&
-    probe.petStateSwitch.framesLoaded >= 12 &&
-    probe.layout.after &&
-    probe.layout.contentAfter &&
-    probe.layout.contentAfter.width === WINDOW_SIZES.expanded.width &&
-    probe.layout.contentAfter.height === WINDOW_SIZES.expanded.height
+    probe.layout.contentBefore &&
+    probe.layout.contentBefore.width === WINDOW_SIZES.compact.width &&
+    probe.layout.contentBefore.height === WINDOW_SIZES.compact.height
   );
 
   console.log(`RASGULLA_PROBE ${JSON.stringify(probe)}`);

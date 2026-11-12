@@ -3,14 +3,10 @@
 The old version of this test only checked that the process stayed alive, which
 passed even while the app threw during load and never opened a window.  This
 version drives the app's own ``--probe`` mode and asserts on what really
-happened inside the two renderers:
+happened inside the renderer.
 
-- both windows were created,
-- the vendored Speaking Orb custom element was defined,
-- the renderer script ran,
-- the chat panel starts hidden,
-- the pet loaded its sprite frames and actually drew pixels,
-- the Python brain answered the handshake with a ready router.
+The app was stripped down to one face: the name, the three phases and the orb.
+Nothing else may be on screen, and the pet overlay must be gone.
 
 It prints the probe payload so a failure can be read without a debugger.
 """
@@ -106,58 +102,53 @@ def main() -> int:
 
     windows = probe.get("windows", {})
     check("the orb window was created", windows.get("orb") is True, str(windows))
-    check("the pet window was created", windows.get("pet") is True, str(windows))
+    check("there is no pet window", windows.get("pet") in (None, False), str(windows))
+    check("the orb window is the only window", windows.get("count") == 1, str(windows))
 
     orb = probe.get("orb", {})
     check("the speaking orb element is defined", orb.get("elementDefined") is True, str(orb))
     check("the renderer script ran", orb.get("rendererRan") is True, str(orb))
-    check("the chat panel starts hidden", orb.get("panelHiddenAtStart") is True, str(orb))
     check("the orb has a shadow root", orb.get("shadowRoot") is True, str(orb))
-
-    pet = probe.get("pet", {})
-    check("the pet loaded sprite frames", int(pet.get("framesLoaded", 0)) >= 12, str(pet))
-    check("the pet drew visible pixels", int(pet.get("canvasNonTransparentPixels", 0)) > 0, str(pet))
-    check("no pet frame failed to load", int(pet.get("frameErrors", 0)) == 0, str(pet))
-
-    switch = probe.get("petStateSwitch", {})
+    check("the name shown is Rasgulla", orb.get("brandText") == "Rasgulla", str(orb))
     check(
-        "a busy orb switches the pet to the work frames",
-        switch.get("setName") == "work",
-        str(switch),
+        "there are exactly three phases",
+        orb.get("phaseCount") == 3,
+        str(orb),
     )
     check(
-        "the work frame set loaded completely",
-        int(switch.get("framesLoaded", 0)) >= 12 and int(switch.get("frameErrors", 0)) == 0,
-        str(switch),
+        "the phases are Listening, Thinking and Speaking",
+        orb.get("phaseLabels") == ["Listening", "Thinking", "Speaking"],
+        str(orb),
     )
+    check("there is no text input", orb.get("hasInput") is False, str(orb))
+    check("there is no chat panel", orb.get("hasPanel") is False, str(orb))
+    check("there is no headline strip", orb.get("hasStrip") is False, str(orb))
+    check("there is no plan card", orb.get("hasPlanCard") is False, str(orb))
+    check("there is no confirm card", orb.get("hasConfirmCard") is False, str(orb))
+    check("the orb is clickable", orb.get("orbCursor") == "pointer", str(orb))
 
     brain = probe.get("brain", {})
     check("the brain child is alive", brain.get("alive") is True, str(brain))
     check("the brain answered ready", brain.get("type") == "ready", str(brain))
     check("the brain router is configured", brain.get("configError") == "", str(brain))
+    check(
+        "the default voice is the expressive one",
+        brain.get("voiceId") == "en-IN-NeerjaExpressiveNeural",
+        str(brain),
+    )
+    check("the brain accepts the mic command", brain.get("micAccepted") is True, str(brain))
 
     assets = probe.get("assets", {})
     check("the vendor component was served", assets.get("orbScript") is True, str(assets))
-    check("a pet frame was served", assets.get("petFrame") is True, str(assets))
+    check("no pet frame was served", assets.get("petFrame") in (None, False), str(assets))
 
     layout = probe.get("layout", {})
     # The content area is what the spec describes; Windows adds a one pixel
     # invisible border around the frameless window itself.
     check(
-        "the orb window starts compact",
+        "the orb window is the compact size",
         layout.get("contentBefore", {}).get("width") == 440
         and layout.get("contentBefore", {}).get("height") == 660,
-        str(layout),
-    )
-    check(
-        "the orb window expands to the spec size",
-        layout.get("contentAfter", {}).get("width") == 980
-        and layout.get("contentAfter", {}).get("height") == 700,
-        str(layout),
-    )
-    check(
-        "the chat panel appears when expanded",
-        layout.get("panelDisplayWhenExpanded") not in (None, "none"),
         str(layout),
     )
 
