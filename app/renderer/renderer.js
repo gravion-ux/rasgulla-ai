@@ -44,16 +44,25 @@ function pill(state) {
   for (const button of document.querySelectorAll('.pill button')) {
     button.setAttribute('aria-pressed', button.dataset.state === state ? 'true' : 'false');
   }
+  // The pet overlay follows the orb: idle frames while resting, work frames
+  // while a request is in flight.
+  if (typeof rasgulla.setOrbState === 'function') {
+    rasgulla.setOrbState(state);
+  }
 }
 
 function setLevel(value) {
   orb.setAttribute('level', Math.min(1, Math.max(0, Number(value) || 0)).toFixed(3));
 }
 
-function saySpoken(text, audioBase64, words) {
+// Lets the shell drive the orb state, so the pet overlay can follow it.
+window.__rasgullaSetOrbState = (state) => pill(state);
+
+function saySpoken(text, audioBase64, words, mime) {
   const clean = String(text || '').trim();
   if (!clean) return;
   orb.setAttribute('state', 'speaking');
+  pill('speaking');
   if (voiceUrl) {
     URL.revokeObjectURL(voiceUrl);
     voiceUrl = null;
@@ -62,7 +71,7 @@ function saySpoken(text, audioBase64, words) {
     const binary = atob(audioBase64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const blob = new Blob([bytes], { type: 'audio/mpeg' });
+    const blob = new Blob([bytes], { type: mime || 'audio/mpeg' });
     voiceUrl = URL.createObjectURL(blob);
     audio.src = voiceUrl;
   }
@@ -74,15 +83,22 @@ function saySpoken(text, audioBase64, words) {
   orb.say(clean, { words: lineWords, audio });
   if (!audioBase64) {
     // No real audio: the orb falls back to its estimated envelope.
-    orb.setAttribute('state', orb.getAttribute('rest') || 'listening');
+    const rest = orb.getAttribute('rest') || 'listening';
+    orb.setAttribute('state', rest);
+    pill(rest);
   } else {
     audio.addEventListener('ended', () => {
-      orb.setAttribute('state', orb.getAttribute('rest') || 'listening');
+      const rest = orb.getAttribute('rest') || 'listening';
+      orb.setAttribute('state', rest);
+      pill(rest);
     }, { once: true });
   }
 }
 
 async function handleMessage(message) {
+  const route = message.route || {};
+  const descriptions = Array.isArray(message.descriptions) ? message.descriptions : [];
+  const rejections = Array.isArray(message.rejections) ? message.rejections : [];
   switch (message.type) {
     case 'ready':
       pill('listening');
@@ -108,11 +124,11 @@ async function handleMessage(message) {
       break;
     case 'plan':
       appendTranscript('Rasgulla', message.reply);
-      routeCaption.textContent = `Route: ${message.route.tier_label || message.route.tier || '-'} / ${message.route.label || '-'} - ${message.route.seconds}s - ${message.route.tokens} tokens`;
+      routeCaption.textContent = `Route: ${route.tier_label || route.tier || '-'} / ${route.label || '-'} - ${route.seconds || 0}s - ${route.tokens || 0} tokens`;
       if (message.warning) appendTranscript('Rasgulla', message.warning, 'note');
       if (message.clarify) appendTranscript('Rasgulla', message.clarify, 'note');
       if (message.speech) {
-        saySpoken(message.speech, message.audio, message.words);
+        saySpoken(message.speech, message.audio, message.words, message.mime);
       }
       if (message.actions && message.actions.length) {
         planCard.classList.remove('hidden');
@@ -129,10 +145,10 @@ async function handleMessage(message) {
           });
           const desc = document.createElement('span');
           desc.className = 'desc';
-          desc.textContent = `${index + 1}. ${message.descriptions[index] || ''}`;
+          desc.textContent = `${index + 1}. ${descriptions[index] || ''}`;
           row.appendChild(checkbox);
           row.appendChild(desc);
-          if (message.rejections && message.rejections.includes(message.descriptions[index] || '')) {
+          if (rejections.includes(descriptions[index] || '')) {
             const badge = document.createElement('span');
             badge.className = 'rejected';
             badge.textContent = 'rejected';
@@ -179,7 +195,12 @@ btnSend.addEventListener('click', async () => {
   entry.value = '';
   appendTranscript('You', text, 'me');
   pill('thinking');
-  await rasgulla.sendToBrain({ command: 'route', text, mode: 'auto', speak: true });
+  try {
+    await rasgulla.sendToBrain({ command: 'route', text, mode: 'auto', speak: true });
+  } catch (error) {
+    appendTranscript('System', `The brain did not answer: ${error.message}`, 'note');
+    pill('listening');
+  }
 });
 
 btnPin.addEventListener('click', async () => {
@@ -223,4 +244,31 @@ entry.addEventListener('keydown', (event) => {
   if (event.key === 'Enter') btnSend.click();
 });
 
+// -- layout -------------------------------------------------------------------
+
+function applyLayout(isExpanded) {
+  const expanded = Boolean(isExpanded);
+  document.body.classList.toggle('expanded', expanded);
+  panel.classList.toggle('hidden', !expanded);
+  btnCollapse.textContent = expanded ? 'collapse' : 'expand';
+  btnCollapse.title = expanded ? 'Collapse the chat panel' : 'Expand the chat panel';
+}
+
+btnCollapse.addEventListener('click', async () => {
+  try {
+    const result = await rasgulla.toggleExpand();
+    applyLayout(result && result.expanded);
+  } catch (error) {
+    appendTranscript('System', `The window could not be resized: ${error.message}`, 'note');
+  }
+});
+
+rasgulla.onLayout((state) => {
+  applyLayout(state && state.expanded);
+});
+
+applyLayout(false);
+
 rasgulla.sendToBrain({ command: 'hello' }).catch(() => {});
+
+window.__rasgullaRendererReady = true;

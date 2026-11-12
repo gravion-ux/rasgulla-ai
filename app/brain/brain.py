@@ -26,6 +26,10 @@ def main() -> int:
             out.flush()
             continue
         result = session.handle(command)
+        # The id has to come back, otherwise the shell can never match this
+        # reply to the request that asked for it.
+        if "id" in command:
+            result["id"] = command["id"]
         out.write(json.dumps(result) + "\n")
         out.flush()
         if command.get("command") == "shutdown":

@@ -24,7 +24,8 @@ from typing import Any
 
 APP_DIR = Path(__file__).resolve().parent.parent
 BRAIN_DIR = Path(__file__).resolve().parent
-for _p in (str(APP_DIR), str(BRAIN_DIR)):
+PROJECT_ROOT = APP_DIR.parent
+for _p in (str(PROJECT_ROOT), str(BRAIN_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -59,9 +60,9 @@ except Exception:  # noqa: BLE001 - TTS is optional at import time
     TTS_AVAILABLE = False
     tts_synthesize = None
 
-MODELS_DIR = APP_DIR / "models"
-CONFIG_PATH = APP_DIR / "models.json"
-USAGE_PATH = APP_DIR / "usage.json"
+MODELS_DIR = PROJECT_ROOT / "models"
+CONFIG_PATH = PROJECT_ROOT / "models.json"
+USAGE_PATH = PROJECT_ROOT / "usage.json"
 
 
 class _BrainShim:

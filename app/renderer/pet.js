@@ -3,18 +3,27 @@
 const canvas = document.getElementById('sprite');
 const ctx = canvas.getContext('2d');
 const bubble = document.getElementById('bubble');
+const ipc = window.rasgulla;
 
 const FRAMES = 12;
+const FRAME_MS = 120;
+
 let setName = 'idle';
+let wantedSet = 'idle';
 let index = 0;
 let images = [];
 let raf = null;
 let lastTime = 0;
 let bubbleTimer = null;
+let loading = false;
 
 const AMBER = [245, 165, 36];
 const PINK = [236, 72, 153];
 const NEUTRAL = [244, 238, 245];
+
+// The smoke test reads this to see what the overlay really did.
+const petState = { framesLoaded: 0, frameErrors: 0, setName: 'idle' };
+window.__rasgullaPet = petState;
 
 function tintPixel(data, i) {
   const r = data[i];
@@ -41,6 +50,9 @@ function tintPixel(data, i) {
 }
 
 function tintImage(img) {
+  // A frame that never loaded has no size, and getImageData refuses to read a
+  // zero-sized region - that used to throw and kill the whole overlay.
+  if (!img || !img.width || !img.height) return null;
   const off = document.createElement('canvas');
   off.width = img.width;
   off.height = img.height;
@@ -54,26 +66,58 @@ function tintImage(img) {
   return off;
 }
 
-async function loadSet(name) {
-  setName = name;
-  images = [];
-  for (let i = 0; i < FRAMES; i++) {
+function loadImage(url) {
+  return new Promise((resolve) => {
     const img = new Image();
-    img.src = `orb-vendor://assets/pet-frames/${name}_${String(i).padStart(2, '0')}.png`;
-    await new Promise((resolve) => {
-      img.onload = resolve;
-      img.onerror = resolve;
-    });
-    images.push(tintImage(img));
+    // The handlers go on before the source, so a cached frame cannot fire its
+    // event before anyone is listening.
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+}
+
+async function loadSet(name) {
+  loading = true;
+  const next = [];
+  let errors = 0;
+  for (let i = 0; i < FRAMES; i++) {
+    const file = `${name}_${String(i).padStart(2, '0')}.png`;
+    const img = await loadImage(`orb-vendor://assets/pet-frames/${file}`);
+    const tinted = tintImage(img);
+    if (!tinted) {
+      errors += 1;
+      continue;
+    }
+    next.push(tinted);
   }
-  index = 0;
-  draw();
+  loading = false;
+  if (next.length) {
+    images = next;
+    setName = name;
+    index = 0;
+    petState.framesLoaded = images.length;
+    petState.frameErrors = errors;
+    petState.setName = name;
+    draw();
+  }
+  if (wantedSet !== setName && wantedSet !== name) {
+    // another set was asked for while this one was loading
+    loadSet(wantedSet);
+  }
+}
+
+function requestSet(name) {
+  wantedSet = name;
+  if (loading) return;
+  if (name === setName && images.length) return;
+  loadSet(name);
 }
 
 function draw() {
-  if (!images[index]) return;
+  if (!images.length) return;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const img = images[index];
+  const img = images[index % images.length];
   const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
   const w = img.width * scale;
   const h = img.height * scale;
@@ -84,11 +128,15 @@ function draw() {
 
 function tick(now) {
   if (!raf) return;
-  const dt = lastTime ? Math.min((now - lastTime) / 1000, 0.05) : 0;
-  lastTime = now;
-  if (dt > 0.08) {
-    index = (index + 1) % images.length;
-    draw();
+  if (!lastTime) lastTime = now;
+  // The old code compared a clamped delta against a larger limit, so the
+  // sprite never advanced a frame.
+  if (now - lastTime >= FRAME_MS) {
+    lastTime = now;
+    if (images.length) {
+      index = (index + 1) % images.length;
+      draw();
+    }
   }
   raf = requestAnimationFrame(tick);
 }
@@ -126,10 +174,10 @@ function randomIdleLine() {
   return lines[Math.floor(Math.random() * lines.length)];
 }
 
-// Canvas drag
+// -- canvas drag -------------------------------------------------------------
+
 let dragging = false;
 let dragOffset = { x: 0, y: 0 };
-const ipc = window.rasgulla;
 
 canvas.addEventListener('mousedown', (event) => {
   if (event.button === 0) {
@@ -142,7 +190,10 @@ window.addEventListener('mousemove', (event) => {
   if (!dragging) return;
   const dx = event.clientX - dragOffset.x;
   const dy = event.clientY - dragOffset.y;
-  ipc.sendToBrain({ command: 'pet_move', dx, dy }).catch(() => {});
+  if (dx === 0 && dy === 0) return;
+  // Send the step, not the distance from the start, or the window runs away.
+  dragOffset = { x: event.clientX, y: event.clientY };
+  ipc.movePet(dx, dy).catch(() => {});
 });
 
 window.addEventListener('mouseup', () => {
@@ -150,7 +201,7 @@ window.addEventListener('mouseup', () => {
 });
 
 canvas.addEventListener('dblclick', () => {
-  ipc.sendToBrain({ command: 'focus_orb' }).catch(() => {});
+  ipc.focusOrb().catch(() => {});
 });
 
 canvas.addEventListener('contextmenu', (event) => {
@@ -158,4 +209,12 @@ canvas.addEventListener('contextmenu', (event) => {
   showBubble(randomIdleLine());
 });
 
-loadSet('idle').then(start);
+// -- follow the orb ----------------------------------------------------------
+
+ipc.onPetState((payload) => {
+  const name = payload && payload.state ? String(payload.state) : '';
+  const busy = name === 'thinking' || name === 'searching' || name === 'speaking';
+  requestSet(busy ? 'work' : 'idle');
+});
+
+requestSet('idle').then(start);
