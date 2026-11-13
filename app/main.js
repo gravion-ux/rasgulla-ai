@@ -16,6 +16,7 @@ const PROBE_MODE = process.argv.includes('--probe');
 const LIVE_PROBE_MODE = process.argv.includes('--probe-live');
 const SHOT_MODE = process.argv.includes('--probe-shot');
 const TALK_MODE = process.argv.includes('--probe-talk');
+const WAKE_MODE = process.argv.includes('--probe-wake');
 
 let orbWindow = null;
 let brainProcess = null;
@@ -24,9 +25,24 @@ let shuttingDown = false;
 let pendingId = 0;
 const pending = new Map();
 const served = { orbScript: false };
+// The last greeting the brain sent, so a probe can look at what she said.
+let lastGreeting = null;
+// The last complaint the brain made, and the tail of its log, so a probe
+// can say what went wrong instead of only what did not happen.
+let lastBrainError = '';
+const brainLogLines = [];
 // How many messages of each kind the brain has sent, so a probe can tell
 // what really arrived instead of what was asked for.
-const brainCounts = { total: 0, level: 0, mic_state: 0, transcript: 0, plan: 0 };
+const brainCounts = {
+  total: 0,
+  level: 0,
+  mic_state: 0,
+  mic_state_wake: 0,
+  transcript: 0,
+  plan: 0,
+  wake: 0,
+  greeting: 0,
+};
 
 // The scheme has to be declared before the app is ready.  It is deliberately
 // not a "standard" scheme, so Chromium hands the request over as the exact
@@ -119,6 +135,9 @@ function spawnBrain() {
       const kind = message && message.type;
       brainCounts.total += 1;
       if (typeof brainCounts[kind] === 'number') brainCounts[kind] += 1;
+      if (kind === 'mic_state' && message.state === 'wake') brainCounts.mic_state_wake += 1;
+      if (kind === 'greeting') lastGreeting = message;
+      if (kind === 'error') lastBrainError = String(message.message || '');
       const id = message.id;
       const resolver = id != null ? pending.get(id) : null;
       if (resolver) {
@@ -135,6 +154,8 @@ function spawnBrain() {
   child.stderr.on('data', (chunk) => {
     const text = chunk.toString().trim();
     if (!text) return;
+    brainLogLines.push(text);
+    if (brainLogLines.length > 40) brainLogLines.shift();
     if (orbWindow && orbWindow.webContents) {
       orbWindow.webContents.send('brain:log', { message: text });
     }
@@ -145,6 +166,19 @@ function spawnBrain() {
         message: `the brain could not be started: ${error.message}`,
       });
     }
+  });
+  child.on('spawn', () => {
+    // The renderer says hello itself when the app starts, so this is only
+    // for a brain that came back after a crash.  The renderer then opens the
+    // microphone again and the wake word works after a restart too.
+    if (brainRestarts === 0) return;
+    sendToBrain({ command: 'hello' })
+      .then((reply) => {
+        if (orbWindow && orbWindow.webContents) {
+          orbWindow.webContents.send('brain:event', reply);
+        }
+      })
+      .catch(() => { /* the brain is not ready yet; it will say hello later */ });
   });
   child.on('exit', () => {
     brainProcess = null;
@@ -232,6 +266,8 @@ app.whenReady().then(async () => {
     await runShotProbe();
   } else if (TALK_MODE) {
     await runTalkProbe();
+  } else if (WAKE_MODE) {
+    await runWakeProbe();
   } else if (PROBE_MODE) {
     await runProbe();
   }
@@ -344,6 +380,9 @@ async function runLiveProbe() {
     captionText: captionSeen,
     audioEverPlayed: audioEverPlayed,
     state: state,
+    errors: brainCounts.error,
+    lastError: lastBrainError,
+    brainLog: brainLogLines.slice(-8),
   };
   console.log(`RASGULLA_LIVE ${JSON.stringify(live)}`);
   stopBrain();
@@ -393,10 +432,13 @@ const TALK_PROBE = `(() => {
   const orb = document.getElementById("orb");
   const cap = orb && orb.shadowRoot ? orb.shadowRoot.querySelector(".cap") : null;
   const active = document.querySelector('.pill button[aria-pressed="true"]');
+  const audio = document.getElementById("voice");
   return {
     phase: active ? active.textContent.trim().toLowerCase() : null,
     captionText: cap ? cap.textContent : "",
-    orbState: orb ? orb.getAttribute("state") : null
+    orbState: orb ? orb.getAttribute("state") : null,
+    audioIsBlob: audio ? audio.src.startsWith("blob:") : false,
+    audioPaused: audio ? audio.paused : null
   };
 })()`;
 
@@ -404,6 +446,11 @@ async function runTalkProbe() {
   // The whole point of the app: click the orb, it hears you, it answers.
   await waitForLoad(orbWindow);
   await sleep(2500);
+
+  // She sleeps with the microphone open, so the listener is closed first.
+  // That way the levels that follow can only come from the click.
+  await sendToBrain({ command: 'listen', on: false });
+  await sleep(1500);
 
   // One link: a level event from the brain has to move the orb.
   orbWindow.webContents.send('brain:event', { type: 'level', value: 0.77 });
@@ -435,11 +482,13 @@ async function runTalkProbe() {
   });
   let phase = null;
   let captionText = '';
+  let audioIsBlob = false;
   for (let i = 0; i < 40; i++) {
     await sleep(1000);
     const state = await orbWindow.webContents.executeJavaScript(TALK_PROBE);
     phase = state.phase;
     captionText = state.captionText;
+    audioIsBlob = state.audioIsBlob;
     if (phase === 'speaking' && captionText.trim().length > 0) break;
   }
   const planEvents = brainCounts.plan - plansBefore;
@@ -451,18 +500,103 @@ async function runTalkProbe() {
     planEvents: planEvents,
     phase: phase,
     captionText: captionText,
+    audioIsBlob: audioIsBlob,
     ok: Boolean(
       orbLevel === 0.77 &&
       micLevels > 0 &&
       micClosedEvents > 0 &&
       planEvents > 0 &&
       phase === 'speaking' &&
-      captionText.trim().length > 0
+      captionText.trim().length > 0 &&
+      audioIsBlob
     ),
   };
   console.log(`RASGULLA_TALK ${JSON.stringify(talk)}`);
   stopBrain();
   app.exit(talk.ok ? 0 : 1);
+}
+
+const WAKE_PROBE = `(() => {
+  const orb = document.getElementById("orb");
+  const cap = orb && orb.shadowRoot ? orb.shadowRoot.querySelector(".cap") : null;
+  const active = document.querySelector('.pill button[aria-pressed="true"]');
+  return {
+    phase: active ? active.textContent.trim().toLowerCase() : null,
+    captionText: cap ? cap.textContent : "",
+    micMode: typeof window.__rasgullaGetMicMode === "function" ? window.__rasgullaGetMicMode() : null
+  };
+})()`;
+
+async function runWakeProbe() {
+  // She has to sleep with the microphone open, wake up when she is called,
+  // and greet you out loud.
+  await waitForLoad(orbWindow);
+  await sleep(3000);
+
+  // She opens the microphone by herself and falls asleep in it.
+  let micLevels = 0;
+  let firstLevelAfterMs = -1;
+  const listeningAt = Date.now();
+  for (let i = 0; i < 60; i++) {
+    await sleep(500);
+    micLevels = brainCounts.level;
+    if (micLevels > 0) {
+      firstLevelAfterMs = Date.now() - listeningAt;
+      break;
+    }
+  }
+  const micStateWake = brainCounts.mic_state_wake;
+  // The microphone has to keep up with the room, not only send one level.
+  const levelsAtStart = brainCounts.level;
+  await sleep(3000);
+  const levelRate = brainCounts.level - levelsAtStart;
+
+  // The wake word, or two claps, has to wake her up and make her greet you.
+  const wakesBefore = brainCounts.wake;
+  const greetingsBefore = brainCounts.greeting;
+  await sendToBrain({ command: 'wake', source: 'voice' });
+
+  let phase = null;
+  let captionText = '';
+  let micMode = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(1000);
+    const state = await orbWindow.webContents.executeJavaScript(WAKE_PROBE);
+    phase = state.phase;
+    captionText = state.captionText;
+    micMode = state.micMode;
+    if (phase === 'speaking' && captionText.trim().length > 0) break;
+  }
+
+  const wake = {
+    micLevels: micLevels,
+    levelRate: levelRate,
+    firstLevelAfterMs: firstLevelAfterMs,
+    micStateWake: micStateWake,
+    wakeEvents: brainCounts.wake - wakesBefore,
+    greetingEvents: brainCounts.greeting - greetingsBefore,
+    greetingAudio: Boolean(lastGreeting && lastGreeting.audio),
+    greetingSpeech: lastGreeting ? String(lastGreeting.speech || '') : '',
+    phase: phase,
+    captionText: captionText,
+    micMode: micMode,
+    errors: brainCounts.error,
+    lastError: lastBrainError,
+    brainLog: brainLogLines.slice(-8),
+    ok: Boolean(
+      micLevels > 0 &&
+      micStateWake >= 1 &&
+      brainCounts.wake - wakesBefore >= 1 &&
+      brainCounts.greeting - greetingsBefore >= 1 &&
+      lastGreeting &&
+      lastGreeting.audio &&
+      phase === 'speaking' &&
+      captionText.trim().length > 0
+    ),
+  };
+  console.log(`RASGULLA_WAKE ${JSON.stringify(wake)}`);
+  stopBrain();
+  app.exit(wake.ok ? 0 : 1);
 }
 
 async function runProbe() {

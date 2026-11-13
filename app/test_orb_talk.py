@@ -130,6 +130,11 @@ def main() -> int:
         len(str(talk.get("captionText", "")).strip()) > 0,
         str(talk),
     )
+    check(
+        "the answer really carries a voice",
+        bool(talk.get("audioIsBlob")),
+        str(talk),
+    )
     check("the app exited cleanly", returncode == 0, f"exit={returncode}")
     if returncode != 0:
         print(output[-4000:])

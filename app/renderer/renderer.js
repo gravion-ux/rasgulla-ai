@@ -1,8 +1,11 @@
 'use strict';
 
 // The whole face of Rasgulla: the name, three phases and the orb.
-// Click the orb to open the microphone; the orb reacts to the level, the
-// phase follows the work, and the spoken line is captioned on the orb.
+//
+// She sleeps with the microphone open.  While she sleeps the orb only shows
+// the sound of the room, because she is listening for her name or for two
+// claps.  Click the orb to wake her yourself; the orb reacts to the level,
+// the phase follows the work, and the spoken line is captioned on the orb.
 
 const rasgulla = window.rasgulla;
 const orb = document.getElementById('orb');
@@ -10,8 +13,13 @@ const audio = document.getElementById('voice');
 const btnClose = document.getElementById('btnClose');
 
 let voiceUrl = null;
-let micOpen = false;
+// 'wake' while she sleeps, 'capture' while she listens to a command,
+// 'idle' when the microphone is closed.
+let micMode = 'idle';
 let phase = 'listening';
+// Set when the brain goes away, so the microphone is opened again when it
+// comes back.
+let brainWasDown = false;
 
 function setPhase(next) {
   phase = next;
@@ -31,19 +39,20 @@ function setLevel(value) {
 }
 
 async function setMic(on) {
+  micMode = on ? 'capture' : 'wake';
   try {
     await rasgulla.sendToBrain({ command: 'mic', on: Boolean(on) });
-    micOpen = Boolean(on);
   } catch (error) {
     console.error('[mic]', error.message);
-    micOpen = false;
+    micMode = 'idle';
     setPhase('listening');
   }
 }
 
 async function onOrbClick() {
   if (phase === 'thinking' || phase === 'speaking') return;
-  if (micOpen) {
+  if (micMode === 'capture') {
+    // Put her back to sleep.
     await setMic(false);
     setPhase('listening');
     return;
@@ -101,16 +110,31 @@ function handleMessage(message) {
     case 'ready':
       setPhase('listening');
       setLevel(0);
+      if (brainWasDown) {
+        // The brain came back after a crash, so the microphone is opened
+        // again and the wake word works once more.
+        brainWasDown = false;
+        rasgulla.sendToBrain({ command: 'listen', on: true }).catch(() => {});
+      }
       break;
     case 'level':
       setLevel(message.value);
       break;
     case 'mic_state':
-      micOpen = message.state === 'live';
+      if (message.state === 'capture') micMode = 'capture';
+      else if (message.state === 'wake') micMode = 'wake';
+      else micMode = 'idle';
+      break;
+    case 'wake':
+      // She heard her name, or two claps.
+      micMode = 'capture';
+      setPhase('listening');
+      break;
+    case 'greeting':
+      speak(message.speech, message.audio, message.words, message.mime);
       break;
     case 'transcript':
       if (message.final) {
-        micOpen = false;
         ask(message.text);
       }
       break;
@@ -123,7 +147,8 @@ function handleMessage(message) {
       break;
     case 'brain_down':
       console.error('[brain] the brain stopped');
-      micOpen = false;
+      micMode = 'idle';
+      brainWasDown = true;
       setPhase('listening');
       break;
   }
@@ -146,7 +171,10 @@ rasgulla.onBrainLog((log) => {
 // Test hooks: the acceptance test drives the app through these.
 window.__rasgullaAsk = (text) => ask(text);
 window.__rasgullaGetPhase = () => phase;
+window.__rasgullaGetMicMode = () => micMode;
 
 rasgulla.sendToBrain({ command: 'hello' }).catch(() => {});
+// She sleeps with the microphone open, so the wake word is always heard.
+rasgulla.sendToBrain({ command: 'listen', on: true }).catch(() => {});
 
 window.__rasgullaRendererReady = true;

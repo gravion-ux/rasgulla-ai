@@ -30,6 +30,9 @@ from session import BrainSession
 
 PASSED = 0
 FAILED: list[str] = []
+# How many voice models were built, so a test can see when the model is
+# loaded again instead of being kept.
+MODEL_BUILDS = 0
 
 
 def check(name, condition, detail=""):
@@ -97,6 +100,8 @@ def fake_vosk_module(words=None, final_text=""):
 
     class Model:
         def __init__(self, path):
+            global MODEL_BUILDS
+            MODEL_BUILDS += 1
             self.path = path
 
     class KaldiRecognizer:
@@ -143,6 +148,28 @@ def restore_fake_mic(saved):
 
 
 @contextlib.contextmanager
+def fake_tts():
+    """Replace the speech engine, so no test ever reaches the network."""
+    import session as session_module
+
+    saved = session_module.tts_synthesize
+
+    def synth(text, voice_id=None):
+        return {
+            "audio": "ZmFrZS1hdWRpbw==",
+            "mime": "audio/mpeg",
+            "words": [{"w": text, "start": 0.0, "end": 1.5}],
+            "text": text,
+        }
+
+    session_module.tts_synthesize = synth
+    try:
+        yield
+    finally:
+        session_module.tts_synthesize = saved
+
+
+@contextlib.contextmanager
 def fake_models_dir():
     """Point the session at a throwaway folder that holds the voice model."""
     import session as session_module
@@ -157,7 +184,20 @@ def fake_models_dir():
             session_module.MODELS_DIR = saved
 
 
-def run_mic_loop(session, chunks, words=None, final_text="", timeout=15):
+@contextlib.contextmanager
+def fake_models_dir_at(folder):
+    """Point the session at a model folder that stays the same."""
+    import session as session_module
+
+    saved = session_module.MODELS_DIR
+    session_module.MODELS_DIR = Path(folder)
+    try:
+        yield
+    finally:
+        session_module.MODELS_DIR = saved
+
+
+def run_mic_loop(session, chunks, words=None, final_text="", timeout=15, models_dir=None):
     """Run the microphone loop; report whether it closed on its own."""
     saved_modules = install_fake_mic(chunks, words, final_text)
     finished = threading.Event()
@@ -165,8 +205,12 @@ def run_mic_loop(session, chunks, words=None, final_text="", timeout=15):
 
     def target():
         try:
-            with fake_models_dir():
-                session._mic_loop()
+            if models_dir is None:
+                with fake_models_dir():
+                    session._mic_loop()
+            else:
+                with fake_models_dir_at(models_dir):
+                    session._mic_loop()
         except Exception as error:  # noqa: BLE001 - reported to the caller
             failure.append(f"{type(error).__name__}: {error}")
         finally:
@@ -360,43 +404,50 @@ def test_silence_before_speech_keeps_the_mic_open():
     check("a quiet room never stops the mic", keep_going, "the mic stopped before any speech")
 
 
-def test_silence_after_speech_stops_the_mic():
+def test_silence_after_speech_ends_the_sentence():
     session = BrainSession()
     chunk, state = mic_seam(session)
     if chunk is None:
         check("the mic has a per-chunk seam", False, "no _mic_chunk method")
         return
-    recognizer = FakeRecognizer(results=["hello"], final="hello there")
+    session._mic_mode = "capture"
+    recognizer = FakeRecognizer(results=[], final="hello there")
     chunk(int16_chunk(6000), recognizer, state)  # the user speaks
-    stopped = False
     for _ in range(30):  # three seconds of quiet
-        if not chunk(int16_chunk(0), recognizer, state):
-            stopped = True
-            break
-    check("silence after speech stops the mic", stopped, "the mic kept listening")
+        chunk(int16_chunk(0), recognizer, state)
     transcripts = [event for event in session.drain() if event.get("type") == "transcript"]
-    partials = [event for event in transcripts if event.get("final") is False]
-    check("the words heard so far were reported", len(partials) == 1, str(transcripts))
+    finals = [event for event in transcripts if event.get("final") is True]
+    check("the silence ends the sentence", len(finals) == 1, str(transcripts))
+    check(
+        "the sentence carries the words",
+        bool(finals) and finals[0].get("text") == "hello there",
+        str(transcripts),
+    )
 
 
-def test_mic_loop_reports_idle_after_a_silence_stop():
+def test_the_mic_stays_open_after_a_sentence():
+    session = BrainSession()
+    chunk, state = mic_seam(session)
+    if chunk is None:
+        check("the mic has a per-chunk seam", False, "no _mic_chunk method")
+        return
+    session._mic_mode = "capture"
+    recognizer = FakeRecognizer(results=[], final="hello there")
+    chunk(int16_chunk(6000), recognizer, state)
+    keep_going = True
+    for _ in range(40):  # four seconds of quiet
+        keep_going = chunk(int16_chunk(0), recognizer, state)
+        if not keep_going:
+            break
+    check("the microphone never closes itself", keep_going, "the mic stopped on its own")
+
+
+def test_the_mic_loop_ends_a_sentence_in_silence():
     session = BrainSession()
     chunks = [int16_chunk(6000)] + [int16_chunk(0) for _ in range(30)]
-    stopped, failure = run_mic_loop(session, chunks, words=["hello"], final_text="hello there")
-    check("the mic closes itself after silence", stopped, f"the loop kept running {failure}")
+    stopped, failure = run_mic_loop(session, chunks, words=[], final_text="hello there", timeout=3)
+    check("the microphone loop runs", stopped or not failure, f"{failure}")
     events = session.drain()
-    idle = [
-        event
-        for event in events
-        if event.get("type") == "mic_state" and event.get("state") == "idle"
-    ]
-    check("the mic reports idle exactly once", len(idle) == 1, str(events))
-    levels = [event for event in events if event.get("type") == "level"]
-    check(
-        "the orb settles back to zero",
-        bool(levels) and levels[-1].get("value") == 0.0,
-        str(levels),
-    )
     finals = [
         event
         for event in events
@@ -439,6 +490,231 @@ def test_stopping_an_unstarted_mic_is_safe():
     check("stopping an unstarted mic is safe", first.get("type") == "ok", str(first))
     second = session.handle({"command": "mic", "on": False})
     check("stopping twice is safe", second.get("type") == "ok", str(second))
+
+
+# -- wake up: the wake word and the double clap -------------------------------
+
+def test_wake_phrase_matching():
+    try:
+        from session import normalize_wake_text, strip_wake_words, wake_phrase_in
+    except ImportError:
+        check("the wake word helpers exist", False, "no wake helpers in session.py")
+        return
+    check("the wake word is found", wake_phrase_in("wake up rasgulla") is True)
+    check("wakeup without a space is found", wake_phrase_in("wakeup rasgulla") is True)
+    check("punctuation does not hide it", wake_phrase_in("Wake up, Rasgulla!") is True)
+    check("the name alone is not enough", wake_phrase_in("rasgulla") is False)
+    check("ordinary talk is not a wake word", wake_phrase_in("what time is it") is False)
+    check(
+        "the text is normalised",
+        normalize_wake_text("  Wake   UP, Rasgulla! ") == "wake up rasgulla",
+        repr(normalize_wake_text("  Wake   UP, Rasgulla! ")),
+    )
+    check(
+        "the wake word is taken out of the sentence",
+        strip_wake_words("wake up rasgulla what time is it") == "what time is it",
+        repr(strip_wake_words("wake up rasgulla what time is it")),
+    )
+    check(
+        "a sentence that is only the wake word leaves nothing",
+        strip_wake_words("wake up rasgulla") == "",
+        repr(strip_wake_words("wake up rasgulla")),
+    )
+
+
+def test_clap_detector():
+    try:
+        from session import ClapDetector
+    except ImportError:
+        check("the clap detector exists", False, "no ClapDetector in session.py")
+        return
+    detector = ClapDetector()
+    check("one clap does not wake her", detector.feed(0.9, 0.0) is False)
+    check("the same clap ringing on does not wake her", detector.feed(0.8, 0.05) is False)
+    check("the room going quiet rearms her", detector.feed(0.02, 0.1) is False)
+    check("the second clap wakes her", detector.feed(0.9, 0.4) is True)
+
+    apart = ClapDetector()
+    apart.feed(0.9, 0.0)
+    apart.feed(0.02, 0.1)
+    check(
+        "two claps that are far apart do not wake her",
+        apart.feed(0.9, 9.0) is False,
+        "a clap nine seconds later still counted",
+    )
+
+    quiet = ClapDetector()
+    woke = False
+    for i in range(30):
+        if quiet.feed(0.02, i * 0.1):
+            woke = True
+    check("a quiet room never wakes her", not woke, "the quiet room woke her up")
+
+
+def test_the_wake_word_wakes_the_brain():
+    session = BrainSession()
+    chunks = [int16_chunk(6000) for _ in range(4)]
+    with fake_tts():
+        _stopped, failure = run_mic_loop(session, chunks, words=["wake up rasgulla"], timeout=2)
+    check("the microphone loop ran", not failure, str(failure))
+    events = session.drain()
+    wakes = [event for event in events if event.get("type") == "wake"]
+    check("the wake word wakes her", len(wakes) == 1, str(events))
+    check(
+        "the wake came from the voice",
+        bool(wakes) and wakes[0].get("source") == "voice",
+        str(wakes),
+    )
+    capture = [
+        event
+        for event in events
+        if event.get("type") == "mic_state" and event.get("state") == "capture"
+    ]
+    check("she moves into capture mode", len(capture) >= 1, str(events))
+    greetings = [event for event in events if event.get("type") == "greeting"]
+    check("she greets you", len(greetings) == 1, str(events))
+    check(
+        "the greeting has something to say",
+        bool(greetings) and greetings[0].get("speech"),
+        str(greetings),
+    )
+    check(
+        "the greeting is spoken, not only written",
+        bool(greetings) and greetings[0].get("audio"),
+        str(greetings),
+    )
+
+
+def test_a_double_clap_wakes_the_brain():
+    session = BrainSession()
+    # a clap is a short loud burst; two of them in a row mean wake up
+    chunks = [
+        int16_chunk(14000, frames=200),
+        int16_chunk(0, frames=200),
+        int16_chunk(0, frames=400),
+        int16_chunk(14000, frames=200),
+        int16_chunk(0, frames=200),
+    ]
+    with fake_tts():
+        _stopped, failure = run_mic_loop(session, chunks, words=[], timeout=2)
+    check("the microphone loop ran", not failure, str(failure))
+    events = session.drain()
+    wakes = [event for event in events if event.get("type") == "wake"]
+    check("two claps wake her", len(wakes) == 1, str(events))
+    check(
+        "the wake came from the claps",
+        bool(wakes) and wakes[0].get("source") == "clap",
+        str(wakes),
+    )
+    greetings = [event for event in events if event.get("type") == "greeting"]
+    check("she greets you after the claps", len(greetings) == 1, str(events))
+
+
+def test_capture_mode_turns_speech_into_a_command():
+    session = BrainSession()
+    chunk, state = mic_seam(session)
+    if chunk is None:
+        check("the mic has a per-chunk seam", False, "no _mic_chunk method")
+        return
+    session._mic_mode = "capture"
+    recognizer = FakeRecognizer(results=["what time is it"])
+    chunk(int16_chunk(6000), recognizer, state)
+    transcripts = [event for event in session.drain() if event.get("type") == "transcript"]
+    check("the command is sent", len(transcripts) == 1, str(transcripts))
+    check(
+        "the command is final",
+        bool(transcripts) and transcripts[0].get("final") is True,
+        str(transcripts),
+    )
+    check(
+        "the command carries the words",
+        bool(transcripts) and transcripts[0].get("text") == "what time is it",
+        str(transcripts),
+    )
+
+
+def test_the_mic_command_switches_between_capture_and_sleep():
+    session = BrainSession()
+    saved_modules = install_fake_mic([int16_chunk(0) for _ in range(20)])
+    try:
+        with fake_models_dir():
+            opened = session.handle({"command": "mic", "on": True})
+            check("the mic opens", opened.get("type") == "ok", str(opened))
+            time.sleep(0.3)
+            events = session.drain()
+            capture = [
+                event
+                for event in events
+                if event.get("type") == "mic_state" and event.get("state") == "capture"
+            ]
+            check("it goes into capture mode", len(capture) == 1, str(events))
+            session.handle({"command": "mic", "on": False})
+            time.sleep(0.2)
+            events = session.drain()
+            wake = [
+                event
+                for event in events
+                if event.get("type") == "mic_state" and event.get("state") == "wake"
+            ]
+            check("it goes back to sleep", len(wake) == 1, str(events))
+    finally:
+        restore_fake_mic(saved_modules)
+
+
+def test_the_listen_command_opens_the_microphone_asleep():
+    session = BrainSession()
+    saved_modules = install_fake_mic([int16_chunk(0) for _ in range(20)])
+    try:
+        with fake_models_dir():
+            opened = session.handle({"command": "listen", "on": True})
+            check("the microphone opens", opened.get("type") == "ok", str(opened))
+            time.sleep(0.3)
+            events = session.drain()
+            wake = [
+                event
+                for event in events
+                if event.get("type") == "mic_state" and event.get("state") == "wake"
+            ]
+            check("it starts asleep, listening for the wake word", len(wake) == 1, str(events))
+            closed = session.handle({"command": "listen", "on": False})
+            check("the microphone closes", closed.get("type") == "ok", str(closed))
+    finally:
+        restore_fake_mic(saved_modules)
+
+
+def test_a_long_silence_puts_her_back_to_sleep():
+    session = BrainSession()
+    chunk, state = mic_seam(session)
+    if chunk is None:
+        check("the mic has a per-chunk seam", False, "no _mic_chunk method")
+        return
+    session._mic_mode = "capture"
+    session._mic_last_voice = time.monotonic() - 999
+    recognizer = FakeRecognizer(results=[])
+    chunk(int16_chunk(0), recognizer, state)
+    events = session.drain()
+    wake = [
+        event
+        for event in events
+        if event.get("type") == "mic_state" and event.get("state") == "wake"
+    ]
+    check("she goes back to sleep after a long silence", len(wake) == 1, str(events))
+
+
+def test_the_voice_model_is_kept_between_microphone_sessions():
+    """Opening the microphone again must not load the whole model again."""
+    session = BrainSession()
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        (folder / "vosk-model-small-en-in-0.4").mkdir()
+        before = MODEL_BUILDS
+        for _ in range(2):
+            _stopped, failure = run_mic_loop(
+                session, [int16_chunk(0)], timeout=2, models_dir=folder
+            )
+            check("the microphone ran", not failure, str(failure))
+        built = MODEL_BUILDS - before
+        check("the voice model is loaded once", built == 1, f"loaded {built} times")
 
 
 # -- the entrypoint pumps queued events to stdout ----------------------------
@@ -654,10 +930,20 @@ def main():
     test_mic_chunk_emits_a_level_event()
     test_level_events_are_throttled()
     test_silence_before_speech_keeps_the_mic_open()
-    test_silence_after_speech_stops_the_mic()
-    test_mic_loop_reports_idle_after_a_silence_stop()
+    test_silence_after_speech_ends_the_sentence()
+    test_the_mic_stays_open_after_a_sentence()
+    test_the_mic_loop_ends_a_sentence_in_silence()
     test_mic_loop_reports_idle_after_a_manual_stop()
     test_stopping_an_unstarted_mic_is_safe()
+    test_wake_phrase_matching()
+    test_clap_detector()
+    test_the_wake_word_wakes_the_brain()
+    test_a_double_clap_wakes_the_brain()
+    test_capture_mode_turns_speech_into_a_command()
+    test_the_mic_command_switches_between_capture_and_sleep()
+    test_the_listen_command_opens_the_microphone_asleep()
+    test_a_long_silence_puts_her_back_to_sleep()
+    test_the_voice_model_is_kept_between_microphone_sessions()
     test_entrypoint_pumps_outbox_events()
     test_entrypoint_starts_without_a_sys_path_patch()
     test_entrypoint_reports_a_ready_router()
