@@ -410,6 +410,9 @@ class BrainSession:
         self._mic_listen_wanted = False
         self._mic_last_voice: float | None = None
         self._mic_busy_until = 0.0
+        # True while the orb was clicked, so the microphone closes itself once
+        # the user stops talking.  The always on listener keeps it open.
+        self._mic_from_click = False
         self._claps = ClapDetector()
 
         try:
@@ -660,9 +663,13 @@ class BrainSession:
         """Wake her up, or send her back to sleep."""
         on = bool(command.get("on"))
         if on:
+            # The orb was clicked, so this is a one click conversation: the
+            # microphone closes itself when the user stops talking.
+            self._mic_from_click = True
             self._open_mic()
             self._set_mode("capture")
             return {"type": "ok"}
+        self._mic_from_click = False
         self._set_mode("wake")
         if not self._mic_listen_wanted:
             # Nobody asked for the always on listener, so the microphone
@@ -719,6 +726,7 @@ class BrainSession:
     def _wake(self, source: str) -> None:
         """Wake her up and let her greet you."""
         self._mic_mode = "capture"
+        self._mic_from_click = False
         self._mic_last_voice = time.monotonic()
         self._emit({"type": "wake", "source": source})
         self._emit({"type": "mic_state", "state": "capture"})
@@ -772,8 +780,9 @@ class BrainSession:
 
         The microphone stays open for the life of the app: in `wake` mode she
         only listens for her name or for two claps, in `capture` mode every
-        word is a command.  The answer is always True, because nothing but the
-        user closing the app stops the microphone.
+        word is a command.  The answer is False only when the orb was clicked
+        and the user has gone quiet, because then the microphone has to close
+        itself.
         """
         state.clock += (len(chunk) // 2) / float(MIC_SAMPLE_RATE)
         level = _chunk_level(chunk)
@@ -823,12 +832,17 @@ class BrainSession:
         return True
 
     def _capture_chunk(self, chunk: bytes, recognizer: Any, state: MicState, level: float) -> bool:
-        """Everything she hears now is a command."""
+        """Everything she hears now is a command.
+
+        Returns False when the orb was clicked and the user has gone quiet,
+        because then the microphone has to close itself.
+        """
         if recognizer.AcceptWaveform(chunk):
             result = json.loads(recognizer.Result())
             text = str(result.get("text", "")).strip()
-            state.speech_seen = False
-            state.silence_since = None
+            if not self._mic_from_click:
+                state.speech_seen = False
+                state.silence_since = None
             if text:
                 state.final_sent = True
                 self._say(text)
@@ -848,14 +862,15 @@ class BrainSession:
         # The room went quiet, so the sentence is over.
         state.speech_seen = False
         state.silence_since = None
-        if state.final_sent:
-            return True
-        final = json.loads(recognizer.FinalResult())
-        text = str(final.get("text", "")).strip()
-        state.final_sent = True
-        if text:
-            self._say(text)
-        return True
+        if not state.final_sent:
+            final = json.loads(recognizer.FinalResult())
+            text = str(final.get("text", "")).strip()
+            state.final_sent = True
+            if text:
+                self._say(text)
+        # When the orb was clicked the microphone closes itself, so the shell
+        # can think, answer and settle the orb.  The always on listener stays.
+        return not self._mic_from_click
 
     def _mic_loop(self) -> None:
         import sounddevice as sd
@@ -886,7 +901,11 @@ class BrainSession:
                         chunk = audio_q.get(timeout=0.5)
                     except queue.Empty:
                         continue
-                    self._mic_chunk(chunk, recognizer, state)
+                    if not self._mic_chunk(chunk, recognizer, state):
+                        # The user stopped talking, so the microphone closes
+                        # itself and the orb can think and answer.
+                        self._mic_stop.set()
+                        break
         except Exception as error:  # noqa: BLE001
             self._emit({"type": "error", "message": f"microphone error: {type(error).__name__}"})
         else:

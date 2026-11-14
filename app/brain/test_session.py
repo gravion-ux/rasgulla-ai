@@ -442,6 +442,55 @@ def test_the_mic_stays_open_after_a_sentence():
     check("the microphone never closes itself", keep_going, "the mic stopped on its own")
 
 
+def test_a_clicked_mic_closes_itself_after_silence():
+    """One click is enough: the mic closes when the user stops talking."""
+    session = BrainSession()
+    chunk, state = mic_seam(session)
+    if chunk is None:
+        check("the mic has a per-chunk seam", False, "no _mic_chunk method")
+        return
+    session._mic_mode = "capture"
+    session._mic_from_click = True
+    recognizer = FakeRecognizer(results=[], final="hello there")
+    chunk(int16_chunk(6000), recognizer, state)  # the user speaks
+    keep_going = True
+    for _ in range(30):  # three seconds of quiet
+        keep_going = chunk(int16_chunk(0), recognizer, state)
+        if not keep_going:
+            break
+    check("the clicked microphone closes itself", not keep_going, "the mic kept listening")
+    transcripts = [event for event in session.drain() if event.get("type") == "transcript"]
+    finals = [event for event in transcripts if event.get("final") is True]
+    check("the final transcript is sent once", len(finals) == 1, str(transcripts))
+
+
+def test_the_mic_loop_reports_idle_after_a_silence_stop():
+    session = BrainSession()
+    session._mic_mode = "capture"
+    session._mic_from_click = True
+    chunks = [int16_chunk(6000)] + [int16_chunk(0) for _ in range(30)]
+    stopped, failure = run_mic_loop(session, chunks, words=[], final_text="hello there", timeout=5)
+    check("the mic closes itself after silence", stopped, f"the loop kept running {failure}")
+    events = session.drain()
+    idle = [
+        event
+        for event in events
+        if event.get("type") == "mic_state" and event.get("state") == "idle"
+    ]
+    check("the mic reports idle after a silence stop", len(idle) == 1, str(events))
+    finals = [
+        event
+        for event in events
+        if event.get("type") == "transcript" and event.get("final") is True
+    ]
+    check("the final transcript is sent once", len(finals) == 1, str(events))
+    check(
+        "the final transcript carries the text",
+        bool(finals) and finals[0].get("text") == "hello there",
+        str(finals),
+    )
+
+
 def test_the_mic_loop_ends_a_sentence_in_silence():
     session = BrainSession()
     chunks = [int16_chunk(6000)] + [int16_chunk(0) for _ in range(30)]
@@ -932,6 +981,8 @@ def main():
     test_silence_before_speech_keeps_the_mic_open()
     test_silence_after_speech_ends_the_sentence()
     test_the_mic_stays_open_after_a_sentence()
+    test_a_clicked_mic_closes_itself_after_silence()
+    test_the_mic_loop_reports_idle_after_a_silence_stop()
     test_the_mic_loop_ends_a_sentence_in_silence()
     test_mic_loop_reports_idle_after_a_manual_stop()
     test_stopping_an_unstarted_mic_is_safe()
