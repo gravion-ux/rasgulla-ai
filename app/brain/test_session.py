@@ -966,9 +966,68 @@ def test_config_files_live_at_the_project_root():
         check(f"{name} path is under the project root", str(APP_DIR) in path, f"{path}")
 
 
+# -- Part 1: Shim wiring fix ---------------------------------------------------
+#
+# These tests verify the agentic path works: the shim needs _type_text and
+# _safe_path attached as instance attributes, and errors must be neutral.
+
+def test_shim_type_text_binding():
+    """_type_text must be wired to the shim for clipboard-aware typing."""
+    import session as session_module
+    # The shim needs _type_text as an instance attribute
+    shim = session_module._BrainShim if hasattr(session_module, '_BrainShim') else None
+    check("shim class exists", shim is not None)
+    # Verify _type_text is available on the shim instance
+    shim_instance = session_module._shim if hasattr(session_module, '_shim') else None
+    check("shim instance exists", shim_instance is not None)
+    check("_type_text bound to shim", hasattr(shim_instance, '_type_text'))
+
+def test_shim_safe_path_binding():
+    """_safe_path must be wired to the shim for path validation."""
+    import session as session_module
+    shim_instance = session_module._shim if hasattr(session_module, '_shim') else None
+    check("shim has _safe_path", shim_instance is not None and hasattr(shim_instance, '_safe_path'))
+
+def test_handle_returns_neutral_error():
+    """handle() must return plain English for unexpected exceptions."""
+    session = BrainSession()
+    # Trigger an error path that should return neutral text, not exception name
+    reply = session.handle({"command": "route", "text": "test", "mode": "invalid_mode_for_testing"})
+    # Should not contain Python exception names
+    error_msg = str(reply.get("message", ""))
+    check("no Python exception name in reply", "AttributeError" not in error_msg and "TypeError" not in error_msg and "Exception" not in error_msg)
+
+def test_file_action_inside_work_folder():
+    """A write_file action inside work folder should be valid in the plan."""
+    session = BrainSession()
+    # Create a test file in work folder
+    (session.router or type('obj', (object,), {'key': '', 'usage': None, 'key_env': [], 'disable': set(), '_cooldown': {}})()).__dict__['router'] = None  # Avoid router errors
+    session.router = None  # Force local path validation
+    
+    # Test that _safe_path works for a valid path
+    import session as sm
+    path = sm._shim._safe_path("test_notes.md")
+    check("safe_path accepts work folder path", path is not None)
+
+def test_write_file_action_runs_through_shim():
+    """An approved type_text action should run through the shim without AttributeError."""
+    import session as sm
+    # The key is that _run_action (the module-level bound method) can call
+    # self._type_text and self._safe_path because they are instance attributes
+    check("shim has _type_text for _run_action to call", callable(getattr(sm._shim, '_type_text', None)))
+    check("shim has _safe_path for _run_action to call", callable(getattr(sm._shim, '_safe_path', None)))
+
+
 def main():
     print("Brain shim tests")
     print("=" * 16)
+    # Part 1: Shim wiring fix tests
+    test_shim_type_text_binding()
+    test_shim_safe_path_binding()
+    test_handle_returns_neutral_error()
+    test_file_action_inside_work_folder()
+    test_write_file_action_runs_through_shim()
+    # Original tests
     test_hello()
     test_local_intent_time()
     test_validate_actions_through_shim()

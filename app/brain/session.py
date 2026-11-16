@@ -382,6 +382,11 @@ def _type_text(text: str) -> None:
         _clipboard.write(previous)
 
 
+# Wire instance attributes that the bound methods access via self.
+# _validate_actions calls self._safe_path(), _run_action calls self._type_text().
+_shim._safe_path = _safe_path
+_shim._type_text = _type_text
+
 class BrainSession:
     """One stdio session: configures the brain, runs plans, validates actions."""
 
@@ -448,8 +453,8 @@ class BrainSession:
             return {"type": "error", "message": f"unknown command {kind!r}"}
         try:
             return handler(command)
-        except Exception as error:  # noqa: BLE001 - protocol boundary: never crash the session
-            return {"type": "error", "message": f"{type(error).__name__}: {error}"}
+        except Exception:  # noqa: BLE001 - protocol boundary: never crash the session
+            return {"type": "error", "message": "that step could not be prepared, so nothing ran."}
 
     def drain(self) -> list[dict[str, Any]]:
         """Return all pending async events (mic transcripts, levels)."""
