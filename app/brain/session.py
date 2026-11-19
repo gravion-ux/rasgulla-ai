@@ -47,6 +47,7 @@ from core_router import (
     RouterError,
     TaskClassifier,
     UsageTracker,
+    is_template_slot,
     read_api_key,
 )
 from voice_engine import (
@@ -98,6 +99,13 @@ WAKE_PHRASES = (
     "wake up",
     "wakeup",
 )
+
+# Mode switch phrases for red-team agentic mode
+REDTEAM_ON_PHRASES = ("red team on", "redteam on", "red team mode on")
+REDTEAM_OFF_PHRASES = ("red team off", "redteam off", "normal mode")
+
+# How long a planned step waits for a spoken answer before it is dropped.
+APPROVAL_SECONDS = 25.0
 
 # Words that may be taken off the front of a sentence before it becomes a
 # command.  The bare name belongs here even though it never wakes her up: it
@@ -187,6 +195,54 @@ def strip_wake_words(text: str) -> str:
             changed = True
             break
     return remainder.strip()
+
+
+def mode_switch(text: str) -> str | None:
+    """Return 'auto' or 'redteam' when a mode switch phrase is detected, else None."""
+    normalized = text.lower()
+    if any(phrase in normalized for phrase in REDTEAM_OFF_PHRASES):
+        return "auto"
+    if any(phrase in normalized for phrase in REDTEAM_ON_PHRASES):
+        return "redteam"
+    return None
+
+
+# Voice approval phrases for agentic action execution.
+#
+# The phrases are matched on word boundaries, never as bare substrings: "ha"
+# lives inside "what", "ok" inside "token", "no" inside "notepad" and "chal"
+# inside "challenge".  A substring match would let an ordinary sentence
+# approve a pending step, which is exactly what the approval gate exists to
+# prevent.
+APPROVE_PHRASES = ("haan", "ha", "yes", "ok", "okay", "theek hai", "theek", "run", "run karo", "kar do", "chalao", "approve", "approved", "chal", "chalo", "karo", "ji")
+DECLINE_PHRASES = ("ruk", "ruk jao", "nahi", "no", "mat", "mat karo", "skip", "rehne do", "cancel", "stop", "band karo")
+
+
+def _phrase_matcher(phrases: tuple[str, ...]) -> re.Pattern[str]:
+    """One pattern that finds any of the phrases on word boundaries."""
+    alternatives = "|".join(re.escape(phrase) for phrase in sorted(phrases, key=len, reverse=True))
+    return re.compile(rf"\b(?:{alternatives})\b", re.IGNORECASE)
+
+
+_APPROVE_RE = _phrase_matcher(APPROVE_PHRASES)
+_DECLINE_RE = _phrase_matcher(DECLINE_PHRASES)
+
+
+def approval_decision(text: str) -> str:
+    """Return 'approve', 'decline', or 'other' based on a spoken phrase.
+
+    An approval only counts when the sentence actually carries the phrase on
+    its own words, so an unrelated request never runs a pending step.
+    """
+    normalized = str(text or "").strip()
+    if not normalized:
+        return "other"
+    # The decline wins a tie: "haan mat karo" is a refusal, not an approval.
+    if _DECLINE_RE.search(normalized):
+        return "decline"
+    if _APPROVE_RE.search(normalized):
+        return "approve"
+    return "other"
 
 
 class ClapDetector:
@@ -420,6 +476,14 @@ class BrainSession:
         self._mic_from_click = False
         self._claps = ClapDetector()
 
+        # Voice approval state for agentic action execution
+        self._pending_actions: list[dict[str, Any]] = []
+        self._pending_index: int = 0
+        self._pending_deadline: float = 0.0
+        # The words the microphone really heard.  Only one of these may approve
+        # a step, so the protocol on its own can never run an action.
+        self._heard: list[str] = []
+
         try:
             self.router = ModelRouter(CONFIG_PATH, "", self.usage)
         except RouterError as error:
@@ -510,6 +574,36 @@ class BrainSession:
         speak = bool(command.get("speak", False))
         snapshot = command.get("snapshot")
 
+        # Check for mode switch phrases before routing
+        mode_override = mode_switch(text)
+        if mode_override:
+            self.mode = mode_override
+            spoken = "Red team mode on." if mode_override == "redteam" else "Back to normal mode."
+            return self._plan_payload(spoken, speak=speak, route={"tier": mode_override, "label": mode_override, "seconds": 0.0})
+
+        # A spoken approval only ever runs a step that is waiting for one.
+        if self._pending_actions and self._pending_index < len(self._pending_actions):
+            if self._pending_expired():
+                self._clear_pending()
+                return self._plan_payload(
+                    "That step timed out, so nothing ran. Say it again if you still want it.",
+                    speak=speak,
+                )
+            decision = approval_decision(text)
+            if decision in ("approve", "decline"):
+                if self._was_heard(text):
+                    return self._advance_pending(decision, speak=speak)
+                # The microphone never heard this, so it cannot answer the
+                # question she asked.  Nothing runs and the step is dropped.
+                self._clear_pending()
+                return self._plan_payload(
+                    "That answer was not heard, so nothing ran.",
+                    speak=speak,
+                )
+            # Any other sentence is a new request: the waiting step is dropped
+            # so a later "haan" can never run a step the user moved on from.
+            self._clear_pending()
+
         local = local_intent(text)
         if local is not None and snapshot is None:
             plan = dict(local)
@@ -548,6 +642,68 @@ class BrainSession:
         }
         return self._finalise_plan(plan, speak=speak)
 
+    # -- voice approval ----------------------------------------------------
+
+    def _pending_expired(self) -> bool:
+        """True when the waiting step has been left alone for too long."""
+        return bool(self._pending_deadline) and time.monotonic() > self._pending_deadline
+
+    def _waiting_for_voice(self) -> bool:
+        """True while a step is waiting for an answer that can still be given."""
+        if not self._pending_actions or self._pending_index >= len(self._pending_actions):
+            return False
+        return not self._pending_expired()
+
+    def _arm_pending_step(self) -> None:
+        """Start the silence window for the step that is waiting.
+
+        Every step waits for its own answer, in its own window.  The words
+        heard before the question cannot answer it, so an old "haan" from an
+        earlier turn can never approve these steps.
+        """
+        self._pending_deadline = time.monotonic() + APPROVAL_SECONDS
+        self._heard.clear()
+
+    def _clear_pending(self) -> None:
+        """Forget the waiting step and the actions it belonged to."""
+        self._pending_actions = []
+        self._pending_index = 0
+        self._pending_deadline = 0.0
+        self.current_actions = []
+
+    def _pending_question(self) -> str:
+        """The question for the step that is waiting for an answer."""
+        action = self._pending_actions[self._pending_index]
+        step = self._pending_index + 1
+        return f"Step {step}: {_describe_action(action)}. Run karun?"
+
+    def _advance_pending(self, decision: str, speak: bool) -> dict[str, Any]:
+        """Run or skip the waiting step, then ask for the next one."""
+        action = self._pending_actions[self._pending_index]
+        if decision == "approve":
+            try:
+                outcome = _run_action(action)
+            except Exception:  # noqa: BLE001 - a failed step is reported, never fatal
+                outcome = "that step could not be run"
+            self.action_results.append(f"Ran: {outcome}")
+        else:
+            outcome = "skipped"
+            self.action_results.append(f"Skipped step {self._pending_index + 1}")
+
+        self._pending_index += 1
+        self.current_actions = list(self._pending_actions[self._pending_index :])
+
+        if self._pending_index >= len(self._pending_actions):
+            self._clear_pending()
+            done = "All steps are done. " + "; ".join(self.action_results[-5:])
+            return self._plan_payload(done, speak=speak, results=list(self.action_results[-5:]))
+
+        # The next step is a new question, so it gets its own window and its
+        # own answer.
+        self._arm_pending_step()
+        question = self._pending_question()
+        return self._plan_payload(f"Done. {question}", speak=speak)
+
     def _build_messages(self, request: str, mode: str | None) -> list[dict[str, Any]]:
         if mode is None:
             mode = self.mode
@@ -580,16 +736,27 @@ class BrainSession:
 
         return TIER_BRIEF.get(tier, "")
 
-    def _finalise_plan(self, plan: dict[str, Any], speak: bool) -> dict[str, Any]:
-        reply = str(plan.get("reply", ""))
-        self.turn_count += 1
-        if "gauge" not in reply.lower():
-            reply = f"{reply}\n\n{freedom_gauge(self.turn_count)}"
-        self.history.append({"role": "assistant", "content": reply})
+    def _plan_payload(
+        self,
+        reply: str,
+        speak: bool,
+        route: dict[str, Any] | None = None,
+        actions: list[dict[str, Any]] | None = None,
+        clarify: Any = None,
+        warning: str = "",
+        results: list[str] | None = None,
+        speech_extra: str = "",
+    ) -> dict[str, Any]:
+        """Build the payload the renderer expects and speak it once.
 
-        speech_text = voice_line(reply)
-        spoken = clean_for_speech(speech_text) if speak else ""
+        Every line she says is synthesised here, so the reply and the approval
+        question travel in one piece of audio and the microphone stays quiet
+        for exactly as long as the speech lasts.
 
+        ``speech_extra`` is spoken after the reply.  It is kept apart from the
+        reply because :func:`voice_line` speaks only the character section of
+        a reply, and the approval question has to be heard either way.
+        """
         payload: dict[str, Any] = {
             "type": "plan",
             "reply": reply,
@@ -597,36 +764,75 @@ class BrainSession:
             "audio": "",
             "words": [],
             "mime": "",
-            "clarify": plan.get("clarify"),
-            "warning": plan.get("_warning", ""),
-            "route": plan.get("_route", {}),
-            "actions": [],
-            "descriptions": [],
+            "clarify": clarify,
+            "warning": warning,
+            "route": route or {},
+            "actions": list(actions or []),
+            "descriptions": [_describe_action(action) for action in (actions or [])],
             "rejections": list(getattr(_shim, "action_rejections", [])),
+            "results": list(results or []),
         }
+        if not speak or not TTS_AVAILABLE:
+            return payload
+
+        spoken = clean_for_speech(voice_line(reply))
+        if speech_extra:
+            extra = clean_for_speech(speech_extra)
+            spoken = f"{spoken} {extra}".strip() if spoken else extra
+        if not spoken:
+            return payload
+        voice_id = resolve_voice_id(spoken, self.voice_preset)
+        try:
+            tts_result = tts_synthesize(spoken, voice_id)
+        except Exception:  # noqa: BLE001 - TTS failure is not fatal; the orb falls back to its estimated envelope
+            return payload
+        payload["speech"] = tts_result.get("text", spoken)
+        payload["audio"] = tts_result.get("audio", "")
+        payload["words"] = tts_result.get("words", [])
+        payload["mime"] = tts_result.get("mime", "audio/mpeg")
+        # She is about to talk, so the microphone stops listening.
+        self._mic_busy_until = (
+            time.monotonic() + self._speech_seconds(payload["words"], spoken) + 1.0
+        )
+        return payload
+
+    def _finalise_plan(self, plan: dict[str, Any], speak: bool) -> dict[str, Any]:
+        """Turn a model plan into a spoken, approval-ready payload."""
+        reply = str(plan.get("reply", ""))
+        if is_template_slot(reply):
+            # A model that copied the answer template did not answer at all.
+            # Say something honest instead of reading the template out loud.
+            reply = "That answer did not come through, so there is nothing to show yet."
+        self.turn_count += 1
+        if "gauge" not in reply.lower():
+            reply = f"{reply}\n\n{freedom_gauge(self.turn_count)}"
+        self.history.append({"role": "assistant", "content": reply})
+
         raw_actions = plan.get("actions", [])
         valid = _validate_actions(
             raw_actions if isinstance(raw_actions, list) else []
         )
         self.current_actions = valid
-        for action in valid:
-            payload["actions"].append(action)
-            payload["descriptions"].append(_describe_action(action))
-        if speak and spoken and TTS_AVAILABLE:
-            voice_id = resolve_voice_id(spoken, self.voice_preset)
-            try:
-                tts_result = tts_synthesize(spoken, voice_id)
-                payload["speech"] = tts_result.get("text", spoken)
-                payload["audio"] = tts_result.get("audio", "")
-                payload["words"] = tts_result.get("words", [])
-                payload["mime"] = tts_result.get("mime", "audio/mpeg")
-                # She is about to talk, so the microphone stops listening.
-                self._mic_busy_until = (
-                    time.monotonic() + self._speech_seconds(payload["words"], spoken) + 1.0
-                )
-            except Exception:  # noqa: BLE001, S110 - TTS failure is not fatal; the orb falls back to its estimated envelope
-                pass
-        return payload
+
+        question = ""
+        if valid:
+            # The steps wait for a spoken answer before anything runs.
+            self._pending_actions = list(valid)
+            self._pending_index = 0
+            self._arm_pending_step()
+            question = self._pending_question()
+        else:
+            self._clear_pending()
+
+        return self._plan_payload(
+            f"{reply}\n\n{question}" if question else reply,
+            speak=speak,
+            route=plan.get("_route", {}),
+            actions=valid,
+            clarify=plan.get("clarify"),
+            warning=plan.get("_warning", ""),
+            speech_extra=question,
+        )
 
     # -- actions -----------------------------------------------------------
 
@@ -637,24 +843,45 @@ class BrainSession:
             return {"type": "error", "message": "action index out of range"}
         action = self.current_actions[index]
         if not ok:
+            # Skipping is allowed: it never runs anything.
+            self._skip_pending(index)
             return {"type": "skipped", "index": index, "description": _describe_action(action)}
-        outcome = _run_action(action)
-        return {"type": "action_result", "index": index, "text": outcome}
+        # Running is not.  Only the spoken answer may approve a step, so the
+        # protocol itself must never be a second way in.
+        return {"type": "error", "message": "a step is approved by voice, one at a time."}
 
-    def _cmd_run_plan(self, command: dict[str, Any]) -> dict[str, Any]:
-        indexes = command.get("approved", [])
-        results: list[dict[str, Any]] = []
-        for index in indexes:
-            if not 0 <= index < len(self.current_actions):
-                continue
-            action = self.current_actions[index]
-            outcome = _run_action(action)
-            results.append({"index": index, "text": outcome})
-        self.current_actions = []
-        return {"type": "plan_done", "results": results}
+    def _skip_pending(self, index: int) -> None:
+        """Keep the voice gate in step with a step the user skipped by hand."""
+        if not self._pending_actions:
+            return
+        if index == self._pending_index:
+            self.action_results.append(f"Skipped step {index + 1}")
+            self._pending_index += 1
+        if self._pending_index >= len(self._pending_actions):
+            self._clear_pending()
+            return
+        self.current_actions = list(self._pending_actions[self._pending_index :])
+
+    def _consume_pending(self, index: int) -> None:
+        """Keep the voice gate in step with a step the user ran by hand."""
+        if not self._pending_actions:
+            return
+        if index == self._pending_index:
+            self.action_results.append(f"Ran: step {index + 1}")
+            self._pending_index += 1
+        if self._pending_index >= len(self._pending_actions):
+            self._clear_pending()
+            return
+        self.current_actions = list(self._pending_actions[self._pending_index :])
+
+    def _cmd_run_plan(self, _command: dict[str, Any]) -> dict[str, Any]:
+        # A plan is never run in one go.  Every step waits for its own spoken
+        # answer, so this command has nothing left to do, and the waiting
+        # step stays armed for the voice.
+        return {"type": "error", "message": "each step is approved by voice, one at a time."}
 
     def _cmd_cancel(self, _command: dict[str, Any]) -> dict[str, Any]:
-        self.current_actions = []
+        self._clear_pending()
         stop()
         return {"type": "ok"}
 
@@ -769,7 +996,16 @@ class BrainSession:
         command = strip_wake_words(text)
         if not command:
             return
+        # Remember the words, so only something the microphone really heard
+        # can answer the question she asked.
+        self._heard.append(command.strip().casefold())
+        if len(self._heard) > 8:
+            del self._heard[:-8]
         self._emit({"type": "transcript", "text": command, "final": True})
+
+    def _was_heard(self, text: str) -> bool:
+        """True when the microphone really heard these words."""
+        return str(text or "").strip().casefold() in self._heard
 
     @staticmethod
     def _speech_seconds(words: list[dict[str, Any]], text: str) -> float:
@@ -796,10 +1032,16 @@ class BrainSession:
             # She is talking, so she must not listen to herself.
             return True
 
+        # A step that is waiting for an answer keeps her awake and listening:
+        # the answer to it is spoken, so the microphone has to stay open for
+        # exactly as long as the question waits.
+        waiting = self._waiting_for_voice()
+
         if (
             self._mic_mode == "capture"
             and self._mic_last_voice is not None
             and time.monotonic() - self._mic_last_voice > SLEEP_SECONDS
+            and not waiting
         ):
             # She has been awake for long enough without a word.
             self._set_mode("wake")
@@ -816,8 +1058,12 @@ class BrainSession:
             state.final_sent = False
             self._mic_last_voice = time.monotonic()
 
-        if self._mic_mode == "wake":
+        if self._mic_mode == "wake" and not waiting:
             return self._wake_chunk(chunk, recognizer, state, level)
+        # A step is waiting for an answer, so every word is an answer now.
+        # This is also what a model that thinks for a long time needs: she may
+        # have gone back to sleep before the question was asked, and the answer
+        # still has to reach her.
         return self._capture_chunk(chunk, recognizer, state, level)
 
     def _wake_chunk(self, chunk: bytes, recognizer: Any, state: MicState, level: float) -> bool:

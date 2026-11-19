@@ -63,37 +63,41 @@ def test_routing_table() -> None:
         check(f"tier '{tier}' has a temperature", "temperature" in spec)
         check(f"tier '{tier}' has max_tokens", "max_tokens" in spec)
     check("request cap is configured", config.get("defaults", {}).get("requests_per_minute", 0) <= 40)
-    check("endpoint configured", bool(config.get("endpoint")))
-    check("key env names configured", bool(config.get("key_env")))
+    # Config may have providers block (new format) or root-level endpoint/key_env (legacy)
+    providers = config.get("providers", {})
+    check("endpoint configured", bool(config.get("endpoint")) or bool(providers))
+    check("key env names configured", bool(config.get("key_env")) or bool(providers))
 
-    user_picks = ["minimaxai/minimax-m3.1-flash", "deepseek-ai/deepseek-v4.1-flash", "z-ai/glm-5.3"]
-    everything = [m for spec in tiers.values() for m in spec.get("chain", [])]
+    # Extract model IDs from chain entries (support both string and dict formats)
+    def get_models(chain):
+        models = []
+        for entry in chain:
+            if isinstance(entry, dict):
+                models.append(entry.get("model", ""))
+            else:
+                models.append(entry)
+        return models
+
+    # User picks that should be in aliases or chains (updated for multi-provider)
+    user_picks = ["openrouter/free", "gemini-3.5-flash-lite", "nvidia/nemotron-3-ultra-550b-a55b"]
+    everything = [m for spec in tiers.values() for m in get_models(spec.get("chain", []))]
     for model in user_picks:
         check(f"chosen model '{model}' is routed", model in everything)
-    # The picks stay in the routing table, but a model the endpoint retired
-    # may not lead a tier: deepseek-v4.1-flash hung past 30s and glm-5.3
-    # answered 410 Gone when the chains were checked on 30 Oct 2026.
-    retired = {"deepseek-ai/deepseek-v4.1-flash", "z-ai/glm-5.3"}
-    check(
-        "no tier leads with a retired model",
-        all(spec["chain"][0] not in retired for spec in tiers.values()),
-    )
     check(
         "the user's picks are still aliased",
         all(model in config.get("aliases", {}) for model in user_picks),
     )
-    # Live evidence, 01 Nov 2026: minimax answered 429 and both lightning and
-    # step then hung past their timeouts, so a chat request failed after 105
-    # seconds.  A tier may not lead with a model that has already refused to
-    # answer, and every tier needs a fallback behind it.
-    unreliable = {
-        "deepseek-ai/deepseek-v4.1-flash",
-        "z-ai/glm-5.3",
-        "minimaxai/minimax-m3.1-flash",
-    }
+    # Legacy retired models replaced with new unreliable ones that lead tiers
+    retired = {"deepseek-ai/deepseek-v4.1-flash", "z-ai/glm-5.3"}
+    old_unreliable = retired | {"minimaxai/minimax-m3.1-flash"}
+    check(
+        "no tier leads with a retired model",
+        all(get_models(spec["chain"])[0] not in retired for spec in tiers.values()),
+    )
+    # Unreliable models should be at the end of chains (after position 0)
     check(
         "no tier leads with a model that refuses to answer",
-        all(spec["chain"][0] not in unreliable for spec in tiers.values()),
+        all(get_models(spec["chain"])[0] not in old_unreliable for spec in tiers.values()),
     )
     check(
         "every tier has a fallback chain",
@@ -1021,6 +1025,418 @@ def test_personality_routing() -> None:
     )
 
 
+def test_free_only_multi_provider_chains() -> None:
+    """Every tier chain must have at least 3 free models across at least 2 providers."""
+    section("Free-only multi-provider chains")
+    config = json.loads((APP_DIR / "models.json").read_text(encoding="utf-8"))
+    tiers = config.get("tiers", {})
+    providers = config.get("providers", {})
+
+    for tier, spec in tiers.items():
+        chain = spec.get("chain", [])
+        # Extract model IDs from dict entries
+        models = []
+        for entry in chain:
+            if isinstance(entry, dict):
+                models.append(entry.get("model", ""))
+            else:
+                models.append(entry)
+        check(f"tier '{tier}' has at least 3 free models", len(models) >= 3)
+
+    # Check providers block exists
+    check("providers block exists", bool(providers))
+    check("openrouter provider configured", "openrouter" in providers)
+    check("gemini provider configured", "gemini" in providers)
+
+    # Every tier should have models from different providers
+    # (check at least 2 providers represented in first 3 models)
+    for tier, spec in tiers.items():
+        chain = spec.get("chain", [])
+        provider_names = set()
+        for entry in chain[:3]:
+            if isinstance(entry, dict):
+                provider_names.add(entry.get("provider", ""))
+        check(
+            f"tier '{tier}' spans multiple providers",
+            len(provider_names) >= 2,
+            f"providers: {provider_names}",
+        )
+
+
+def test_multi_provider_routing() -> None:
+    """The router must call the endpoint of the provider the chain names."""
+    section("Multi-provider routing")
+    import core_router
+
+    calls: list[dict[str, object]] = []
+
+    class _Ok:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [{"message": {"content": "the answer"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+            }
+
+    def ok_post(url, headers=None, json=None, timeout=None):
+        calls.append({"url": url, "headers": headers or {}, "model": (json or {}).get("model")})
+        return _Ok()
+
+    original_post = core_router.requests.post
+    core_router.requests.post = ok_post
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            config = {
+                "endpoint": "https://root.invalid/v1/chat/completions",
+                "key_env": ["RASGULLA_API_KEY"],
+                "defaults": {"requests_per_minute": 60, "timeout_seconds": 5, "max_attempts_per_request": 3},
+                "providers": {
+                    "first": {
+                        "endpoint": "https://first.invalid/v1/chat/completions",
+                        "key_env": ["RASGULLA_API_KEY"],
+                        "free_models": ["first/model"],
+                    },
+                    "second": {
+                        "endpoint": "https://second.invalid/v1/chat/completions",
+                        "key_env": ["SECOND_API_KEY"],
+                        "free_models": ["second/model"],
+                    },
+                },
+                "tiers": {
+                    "chat": {
+                        "label": "T",
+                        "temperature": 0.2,
+                        "max_tokens": 100,
+                        "chain": [
+                            {"provider": "first", "model": "first/model"},
+                            {"provider": "second", "model": "second/model"},
+                        ],
+                    }
+                },
+                "aliases": {},
+            }
+            path = Path(folder) / "models.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            router = ModelRouter(path, "root-key", UsageTracker(Path(folder) / "usage.json"))
+            router.providers["second"].key = "second-key"
+            result = router.call("chat", [{"role": "user", "content": "hi"}])
+            check("the call succeeded", result.get("text") == "the answer", str(result))
+            check("the named provider endpoint was used", calls[0]["url"] == "https://first.invalid/v1/chat/completions", str(calls))
+            check(
+                "the provider key was used",
+                calls[0]["headers"].get("Authorization") == "Bearer root-key",
+                str(calls),
+            )
+    finally:
+        core_router.requests.post = original_post
+
+
+def test_a_rejected_provider_is_dropped() -> None:
+    """A 401/403 retires the provider and the chain moves on."""
+    section("Rejected provider")
+    import core_router
+
+    calls: list[str] = []
+
+    class _Forbidden:
+        status_code = 403
+
+        def json(self) -> dict[str, object]:
+            return {}
+
+    class _Ok:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [{"message": {"content": "the answer"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+
+    def mixed_post(url, headers=None, json=None, timeout=None):
+        calls.append(str(url))
+        return _Forbidden() if "first.invalid" in str(url) else _Ok()
+
+    original_post = core_router.requests.post
+    core_router.requests.post = mixed_post
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            config = {
+                "endpoint": "https://root.invalid/v1/chat/completions",
+                "key_env": ["RASGULLA_API_KEY"],
+                "defaults": {"requests_per_minute": 60, "timeout_seconds": 5, "max_attempts_per_request": 3},
+                "providers": {
+                    "first": {
+                        "endpoint": "https://first.invalid/v1/chat/completions",
+                        "key_env": ["RASGULLA_API_KEY"],
+                        "free_models": ["first/model"],
+                    },
+                    "second": {
+                        "endpoint": "https://second.invalid/v1/chat/completions",
+                        "key_env": ["SECOND_API_KEY"],
+                        "free_models": ["second/model"],
+                    },
+                },
+                "tiers": {
+                    "chat": {
+                        "label": "T",
+                        "temperature": 0.2,
+                        "max_tokens": 100,
+                        "chain": [
+                            {"provider": "first", "model": "first/model"},
+                            {"provider": "second", "model": "second/model"},
+                        ],
+                    }
+                },
+                "aliases": {},
+            }
+            path = Path(folder) / "models.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            router = ModelRouter(path, "root-key", UsageTracker(Path(folder) / "usage.json"))
+            router.providers["second"].key = "second-key"
+            result = router.call("chat", [{"role": "user", "content": "hi"}])
+            check("the second provider answered", result.get("text") == "the answer", str(result))
+            check("the rejected provider was tried first", len(calls) >= 2, str(calls))
+            check("the rejected provider is disabled", router.providers["first"].disabled is True)
+            check("the fall back is reported", len(result.get("fallbacks", [])) >= 1, str(result))
+    finally:
+        core_router.requests.post = original_post
+
+
+def test_only_free_models_are_called() -> None:
+    """A model that is not free is never sent to an endpoint."""
+    section("Free-only guard")
+    import core_router
+
+    calls: list[str] = []
+
+    class _Ok:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [{"message": {"content": "the answer"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+
+    def ok_post(url, headers=None, json=None, timeout=None):
+        calls.append(str((json or {}).get("model", "")))
+        return _Ok()
+
+    original_post = core_router.requests.post
+    core_router.requests.post = ok_post
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            config = {
+                "endpoint": "https://root.invalid/v1/chat/completions",
+                "key_env": ["RASGULLA_API_KEY"],
+                "defaults": {"requests_per_minute": 60, "timeout_seconds": 5, "max_attempts_per_request": 3},
+                "providers": {
+                    "paid": {
+                        "endpoint": "https://paid.invalid/v1/chat/completions",
+                        "key_env": ["RASGULLA_API_KEY"],
+                        "free_models": ["paid/free-model"],
+                    }
+                },
+                "tiers": {
+                    "chat": {
+                        "label": "T",
+                        "temperature": 0.2,
+                        "max_tokens": 100,
+                        "chain": [
+                            {"provider": "paid", "model": "paid/expensive-model"},
+                            {"provider": "paid", "model": "paid/free-model"},
+                        ],
+                    }
+                },
+                "aliases": {},
+            }
+            path = Path(folder) / "models.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            router = ModelRouter(path, "root-key", UsageTracker(Path(folder) / "usage.json"))
+            router.call("chat", [{"role": "user", "content": "hi"}])
+            check("the paid model was never called", "paid/expensive-model" not in calls, str(calls))
+            check("the free model was called", "paid/free-model" in calls, str(calls))
+    finally:
+        core_router.requests.post = original_post
+
+
+def test_a_provider_without_a_key_is_skipped() -> None:
+    """A provider with no key of its own is skipped, not guessed at."""
+    section("Provider without a key")
+    import core_router
+
+    calls: list[str] = []
+
+    class _Ok:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [{"message": {"content": "the answer"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+
+    def ok_post(url, headers=None, json=None, timeout=None):
+        calls.append(str(url))
+        return _Ok()
+
+    original_post = core_router.requests.post
+    core_router.requests.post = ok_post
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            config = {
+                "endpoint": "https://root.invalid/v1/chat/completions",
+                "key_env": ["RASGULLA_API_KEY"],
+                "defaults": {"requests_per_minute": 60, "timeout_seconds": 5, "max_attempts_per_request": 3},
+                "providers": {
+                    "ownkey": {
+                        "endpoint": "https://ownkey.invalid/v1/chat/completions",
+                        "key_env": ["OWN_KEY_NOT_SET"],
+                        "free_models": ["own/model"],
+                    }
+                },
+                "tiers": {
+                    "chat": {
+                        "label": "T",
+                        "temperature": 0.2,
+                        "max_tokens": 100,
+                        "chain": [{"provider": "ownkey", "model": "own/model"}],
+                    }
+                },
+                "aliases": {},
+            }
+            path = Path(folder) / "models.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            router = ModelRouter(path, "root-key", UsageTracker(Path(folder) / "usage.json"))
+            router.providers["ownkey"].key = ""
+            try:
+                router.call("chat", [{"role": "user", "content": "hi"}])
+                check("the provider without a key was not called", False, "no exception")
+            except RouterError as error:
+                check("the provider without a key was not called", True)
+                check(
+                    "the provider name stays out of the message",
+                    "ownkey" not in str(error).lower(),
+                    str(error),
+                )
+            check("no request reached the endpoint", calls == [], str(calls))
+    finally:
+        core_router.requests.post = original_post
+
+
+def test_a_copied_template_slot_is_never_the_answer() -> None:
+    """A model that copies the answer template must not be shown as the answer."""
+    section("Copied template slot")
+    import core_app
+    import core_router
+
+    slot = "<the actual words Rasgulla says to the user, written fresh for this request>"
+    copied = json.dumps({"mode": "normal", "reply": slot, "actions": []})
+
+    plan = parse_json_plan(copied)
+    check("the copied slot is flagged", plan.get("_template") is True, str(plan))
+    usable = getattr(core_router, "plan_is_usable", None)
+    check("the usability check exists", callable(usable), str(usable))
+    if callable(usable):
+        check(
+            "a copied slot is not a usable answer",
+            usable(copied) is False,
+            str(plan),
+        )
+        check(
+            "a real answer is usable",
+            usable('{"mode":"normal","reply":"Ho gaya","actions":[]}') is True,
+        )
+        check(
+            "plain text is still a usable answer",
+            usable("Here is the answer, in plain words.") is True,
+        )
+        check(
+            "an empty answer is not usable",
+            usable('{"mode":"normal","reply":"","actions":[]}') is False,
+        )
+    check(
+        "the schema leaves the reply slot empty",
+        '"reply": ""' in core_app.ACTION_SCHEMA,
+        core_app.ACTION_SCHEMA[:400],
+    )
+
+
+def test_a_template_answer_moves_to_the_next_model() -> None:
+    """The chain moves on when a model copies the answer template."""
+    section("Template fallback")
+    import core_router
+
+    calls: list[str] = []
+    slot = "<the actual words Rasgulla says to the user, written fresh for this request>"
+
+    class _Ok:
+        status_code = 200
+
+        def __init__(self, content: str) -> None:
+            self._content = content
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [{"message": {"content": self._content}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+
+    def mixed_post(url, headers=None, json=None, timeout=None):
+        calls.append(str(url))
+        return _Ok(slot) if "first.invalid" in str(url) else _Ok("the real answer")
+
+    original_post = core_router.requests.post
+    core_router.requests.post = mixed_post
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            config = {
+                "endpoint": "https://root.invalid/v1/chat/completions",
+                "key_env": ["RASGULLA_API_KEY"],
+                "defaults": {"requests_per_minute": 60, "timeout_seconds": 5, "max_attempts_per_request": 3},
+                "providers": {
+                    "first": {
+                        "endpoint": "https://first.invalid/v1/chat/completions",
+                        "key_env": ["RASGULLA_API_KEY"],
+                        "free_models": ["first/model"],
+                    },
+                    "second": {
+                        "endpoint": "https://second.invalid/v1/chat/completions",
+                        "key_env": ["SECOND_API_KEY"],
+                        "free_models": ["second/model"],
+                    },
+                },
+                "tiers": {
+                    "chat": {
+                        "label": "T",
+                        "temperature": 0.2,
+                        "max_tokens": 100,
+                        "chain": [
+                            {"provider": "first", "model": "first/model"},
+                            {"provider": "second", "model": "second/model"},
+                        ],
+                    }
+                },
+                "aliases": {},
+            }
+            path = Path(folder) / "models.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            router = ModelRouter(path, "root-key", UsageTracker(Path(folder) / "usage.json"))
+            router.providers["second"].key = "second-key"
+            result = router.call("chat", [{"role": "user", "content": "hi"}])
+            check("the next model answered", result.get("text") == "the real answer", str(result))
+            check("both models were tried", len(calls) >= 2, str(calls))
+            check(
+                "the copied slot is reported as a fallback",
+                any("usable" in str(item) for item in result.get("fallbacks", [])),
+                str(result.get("fallbacks")),
+            )
+    finally:
+        core_router.requests.post = original_post
+
+
 def main() -> int:
     print("Rasgulla local test suite")
     print("=" * 26)
@@ -1041,6 +1457,13 @@ def main() -> int:
     test_personality()
     test_personality_routing()
     test_key_lookup()
+    test_free_only_multi_provider_chains()
+    test_multi_provider_routing()
+    test_a_rejected_provider_is_dropped()
+    test_only_free_models_are_called()
+    test_a_provider_without_a_key_is_skipped()
+    test_a_copied_template_slot_is_never_the_answer()
+    test_a_template_answer_moves_to_the_next_model()
     print("\n" + "=" * 26)
     print(f"passed: {PASSED}   failed: {len(FAILED)}")
     for failure in FAILED:

@@ -991,6 +991,8 @@ def test_shim_safe_path_binding():
 def test_handle_returns_neutral_error():
     """handle() must return plain English for unexpected exceptions."""
     session = BrainSession()
+    # No model in this test, so the request never leaves the machine.
+    session.router = None
     # Trigger an error path that should return neutral text, not exception name
     reply = session.handle({"command": "route", "text": "test", "mode": "invalid_mode_for_testing"})
     # Should not contain Python exception names
@@ -1016,6 +1018,420 @@ def test_write_file_action_runs_through_shim():
     # self._type_text and self._safe_path because they are instance attributes
     check("shim has _type_text for _run_action to call", callable(getattr(sm._shim, '_type_text', None)))
     check("shim has _safe_path for _run_action to call", callable(getattr(sm._shim, '_safe_path', None)))
+
+
+def test_approval_decision_phrases():
+    """Voice phrases map correctly to approve/decline/other."""
+    try:
+        from session import approval_decision
+    except ImportError:
+        check("approval_decision function exists", False, "no approval_decision in session.py")
+        return
+
+    # Approve phrases
+    for phrase in ["haan", "ha", "yes", "ok", "theek hai", "run", "run karo", "kar do", "chalao", "approve", "chal", "karo"]:
+        result = approval_decision(phrase)
+        check(f"'{phrase}' approves", result == "approve", f"got {result}")
+
+    # Decline phrases
+    for phrase in ["ruk", "nahi", "no", "mat", "skip", "rehne do", "cancel", "stop", "ruk jao"]:
+        result = approval_decision(phrase)
+        check(f"'{phrase}' declines", result == "decline", f"got {result}")
+
+    # An ordinary sentence is never an answer.
+    for phrase in ["hello world", "what time is it", "", "tell me about the lab"]:
+        result = approval_decision(phrase)
+        check(f"'{phrase or '(empty)'}' is other", result == "other", f"got {result}")
+
+
+def test_approval_phrases_need_whole_words():
+    """A word that merely contains an approval phrase must not approve."""
+    try:
+        from session import approval_decision
+    except ImportError:
+        check("approval_decision function exists", False, "no approval_decision in session.py")
+        return
+    # "ha" in "what", "ok" in "token", "no" in "notepad", "chal" in "challenge",
+    # "mat" in "format" - a substring match would run a step on all of these.
+    for phrase in ["what time is it", "give me the token", "open notepad now", "challenge the login form", "format the file"]:
+        result = approval_decision(phrase)
+        check(f"'{phrase}' is other", result == "other", f"got {result}")
+    check("a refusal wins over an approval", approval_decision("haan mat karo") == "decline")
+
+
+def test_mode_switch_phrases():
+    """Test mode_switch function for red-team on/off."""
+    try:
+        from session import mode_switch
+    except ImportError:
+        check("mode_switch function exists", False, "no mode_switch in session.py")
+        return
+
+    # Red team on phrases
+    for phrase in ["red team on", "redteam on", "red team mode on"]:
+        result = mode_switch(phrase)
+        check(f"'{phrase}' switches to redteam", result == "redteam", f"got {result}")
+
+    # Red team off phrases
+    for phrase in ["red team off", "redteam off", "normal mode"]:
+        result = mode_switch(phrase)
+        check(f"'{phrase}' switches to auto", result == "auto", f"got {result}")
+
+    # Non-switch phrases
+    for phrase in ["hello world", "what is the weather"]:
+        result = mode_switch(phrase)
+        check(f"'{phrase}' returns None", result is None, f"got {result}")
+
+
+def test_a_step_waits_for_a_spoken_answer():
+    """A planned step must not run before the user says yes."""
+    import session as sm
+
+    session = BrainSession()
+    ran: list[str] = []
+    original_run = sm._run_action
+
+    def fake_run(action):
+        ran.append(str(action.get("path", action.get("type", ""))))
+        return "done"
+
+    sm._run_action = fake_run
+    try:
+        plan = {
+            "reply": "Here is the plan.",
+            "actions": [{"type": "write_file", "path": "voice-gate.txt", "content": "hi"}],
+        }
+        payload = session._finalise_plan(plan, speak=False)
+        check("nothing ran when the plan arrived", ran == [], str(ran))
+        check("the step is waiting", len(session._pending_actions) == 1, str(session._pending_actions))
+        check("the question is in the reply", "Run karun" in str(payload.get("reply", "")), str(payload))
+        check("the question is shown as a step", "Step 1" in str(payload.get("reply", "")), str(payload))
+
+        # The spoken yes runs the step.  The microphone heard it first, and
+        # the renderer hands that word back to the brain.
+        session._say("haan")
+        reply = session.handle({"command": "route", "text": "haan", "mode": "auto", "speak": False})
+        check("the spoken yes ran the step", ran == ["voice-gate.txt"], str(ran))
+        check("the result is reported", "Ran" in str(reply.get("results", reply)), str(reply))
+        check("the plan is finished", session._pending_actions == [], str(session._pending_actions))
+    finally:
+        sm._run_action = original_run
+
+
+def test_a_copied_template_slot_is_never_spoken():
+    """A model that copies the answer template must not be spoken."""
+    session = BrainSession()
+    slot = "<the actual words Rasgulla says to the user, written fresh for this request>"
+    payload = session._finalise_plan({"reply": slot, "actions": []}, speak=False)
+    reply = str(payload.get("reply", ""))
+    check("the copied slot is not in the reply", slot not in reply, reply)
+    check("the reply says something honest instead", bool(reply.strip()), reply)
+    check("the payload is still a plan", payload.get("type") == "plan", str(payload.get("type")))
+
+    # A copied slot must not cost the user a real step either.
+    payload = session._finalise_plan(
+        {
+            "reply": slot,
+            "actions": [{"type": "write_file", "path": "voice-gate.txt", "content": "hi"}],
+        },
+        speak=False,
+    )
+    reply = str(payload.get("reply", ""))
+    check("the copied slot is not in the reply with a step", slot not in reply, reply)
+    check("the step is still waiting", len(session._pending_actions) == 1, str(session._pending_actions))
+
+
+def test_only_the_voice_can_approve_a_step():
+    """The protocol must not offer a second way to run a step."""
+    import session as sm
+
+    session = BrainSession()
+    ran: list[dict] = []
+    original_run = sm._run_action
+
+    def fake_run(action):
+        ran.append(action)
+        return "done"
+
+    sm._run_action = fake_run
+    try:
+        session._finalise_plan(
+            {
+                "reply": "Here is the plan.",
+                "actions": [{"type": "write_file", "path": "voice-gate.txt", "content": "hi"}],
+            },
+            speak=False,
+        )
+        check("the step is waiting", len(session._pending_actions) == 1, str(session._pending_actions))
+
+        reply = session.handle({"command": "act", "index": 0, "ok": True})
+        check("the protocol cannot run a step", ran == [], str(ran))
+        check(
+            "the protocol says the answer has to be spoken",
+            "voice" in str(reply.get("message", "")).lower(),
+            str(reply),
+        )
+
+        reply = session.handle({"command": "run_plan", "approved": [0]})
+        check("the protocol cannot run a plan", ran == [], str(ran))
+        check(
+            "the plan command says the answer has to be spoken",
+            "voice" in str(reply.get("message", "")).lower(),
+            str(reply),
+        )
+        check(
+            "the step is still waiting for the voice",
+            len(session._pending_actions) == 1,
+            str(session._pending_actions),
+        )
+
+        # The spoken answer still runs it.
+        session._say("haan")
+        session.handle({"command": "route", "text": "haan", "mode": "auto", "speak": False})
+        check("the spoken yes still runs the step", len(ran) == 1, str(ran))
+    finally:
+        sm._run_action = original_run
+
+
+def test_only_a_word_the_microphone_heard_can_approve():
+    """A step cannot be approved by text the microphone never heard."""
+    import session as sm
+
+    session = BrainSession()
+    ran: list[str] = []
+    original_run = sm._run_action
+
+    def fake_run(action):
+        ran.append(str(action.get("path", action.get("type", ""))))
+        return "done"
+
+    sm._run_action = fake_run
+    try:
+        plan = {
+            "reply": "Here is the plan.",
+            "actions": [{"type": "write_file", "path": "voice-gate.txt", "content": "hi"}],
+        }
+        session._finalise_plan(plan, speak=False)
+        reply = session.handle({"command": "route", "text": "haan", "mode": "auto", "speak": False})
+        check("the unheard answer ran nothing", ran == [], str(ran))
+        check(
+            "the unheard answer is refused",
+            "not heard" in str(reply.get("reply", "")).lower(),
+            str(reply),
+        )
+        check("the waiting step was dropped", session._pending_actions == [], str(session._pending_actions))
+
+        # The same word, actually spoken, does run the step.
+        session._finalise_plan(plan, speak=False)
+        session._say("haan")
+        session.handle({"command": "route", "text": "haan", "mode": "auto", "speak": False})
+        check("the heard answer ran the step", ran == ["voice-gate.txt"], str(ran))
+    finally:
+        sm._run_action = original_run
+
+
+def test_an_unrelated_request_drops_the_waiting_step():
+    """A new sentence is not an approval: the waiting step is dropped."""
+    import session as sm
+
+    session = BrainSession()
+    # No model in this test, so the request never leaves the machine.
+    session.router = None
+    ran: list[str] = []
+    original_run = sm._run_action
+    sm._run_action = lambda action: ran.append(str(action.get("type", ""))) or "done"
+    try:
+        session._finalise_plan(
+            {
+                "reply": "Here is the plan.",
+                "actions": [{"type": "write_file", "path": "dropped.txt", "content": "hi"}],
+            },
+            speak=False,
+        )
+        session._say("what did you just do")
+        session.handle({"command": "route", "text": "what did you just do", "mode": "auto", "speak": False})
+        check("the unrelated request ran nothing", ran == [], str(ran))
+        check("the waiting step was dropped", session._pending_actions == [], str(session._pending_actions))
+
+        # A later "haan" must not resurrect the dropped step.
+        session.handle({"command": "route", "text": "haan", "mode": "auto", "speak": False})
+        check("a late yes ran nothing", ran == [], str(ran))
+    finally:
+        sm._run_action = original_run
+
+
+def test_a_step_can_be_declined():
+    """A spoken no skips the step without running it."""
+    import session as sm
+
+    session = BrainSession()
+    ran: list[str] = []
+    original_run = sm._run_action
+    sm._run_action = lambda action: ran.append(str(action.get("type", ""))) or "done"
+    try:
+        session._finalise_plan(
+            {
+                "reply": "Here is the plan.",
+                "actions": [{"type": "write_file", "path": "declined.txt", "content": "hi"}],
+            },
+            speak=False,
+        )
+        session._say("nahi")
+        reply = session.handle({"command": "route", "text": "nahi", "mode": "auto", "speak": False})
+        check("the spoken no ran nothing", ran == [], str(ran))
+        check("the skip is reported", "Skipped" in str(reply.get("results", reply)), str(reply))
+    finally:
+        sm._run_action = original_run
+
+
+def test_a_waiting_step_times_out():
+    """A step left alone for too long is dropped, not run later."""
+    import session as sm
+
+    session = BrainSession()
+    ran: list[str] = []
+    original_run = sm._run_action
+    sm._run_action = lambda action: ran.append(str(action.get("type", ""))) or "done"
+    try:
+        session._finalise_plan(
+            {
+                "reply": "Here is the plan.",
+                "actions": [{"type": "write_file", "path": "late.txt", "content": "hi"}],
+            },
+            speak=False,
+        )
+        session._pending_deadline = time.monotonic() - 1.0
+        reply = session.handle({"command": "route", "text": "haan", "mode": "auto", "speak": False})
+        check("the late answer ran nothing", ran == [], str(ran))
+        check("the timeout is reported", "timed out" in str(reply.get("reply", "")), str(reply))
+    finally:
+        sm._run_action = original_run
+
+
+def test_a_step_still_hears_the_answer_after_a_slow_model_call():
+    """A slow model call must not put the microphone to sleep.
+
+    The answer to a step is spoken, so she has to listen for the whole window
+    the question waits.  A model that thinks for longer than that used to send
+    her back to sleep before the question was even asked, and a "haan" heard
+    while she sleeps is never a command, so the step could never be approved.
+    """
+    import session as sm
+
+    session = BrainSession()
+    ran: list[str] = []
+    original_run = sm._run_action
+    sm._run_action = lambda action: ran.append(str(action.get("path", ""))) or "done"
+    chunk, state = mic_seam(session)
+    try:
+        # The model is still thinking: she has been awake for longer than the
+        # window a step waits, so she has gone back to sleep.
+        session._mic_mode = "wake"
+        session._mic_last_voice = time.monotonic() - 999
+        session._finalise_plan(
+            {
+                "reply": "Here is the plan.",
+                "actions": [{"type": "write_file", "path": "slow-call.txt", "content": "hi"}],
+            },
+            speak=False,
+        )
+        check(
+            "the answer is heard while she was asleep",
+            chunk is not None,
+            "no _mic_chunk method",
+        )
+        if chunk is not None:
+            chunk(int16_chunk(6000), FakeRecognizer(results=["haan"]), state)
+            transcripts = [
+                event for event in session.drain() if event.get("type") == "transcript"
+            ]
+            check("the answer reaches the brain", len(transcripts) == 1, str(transcripts))
+        session.handle({"command": "route", "text": "haan", "mode": "auto", "speak": False})
+        check("the answer ran the step", ran == ["slow-call.txt"], str(ran))
+    finally:
+        sm._run_action = original_run
+
+
+def test_the_microphone_stays_awake_while_a_step_is_waiting():
+    """She does not go back to sleep while a step is waiting for an answer.
+
+    A 25 second silence drops the pending step and sends her back to sleep,
+    so the sleep and the step have to end together.  While the step is still
+    waiting, she keeps listening for the answer.
+    """
+    session = BrainSession()
+    chunk, state = mic_seam(session)
+    if chunk is None:
+        check("the mic has a per-chunk seam", False, "no _mic_chunk method")
+        return
+    session._finalise_plan(
+        {
+            "reply": "Here is the plan.",
+            "actions": [{"type": "write_file", "path": "waiting.txt", "content": "hi"}],
+        },
+        speak=False,
+    )
+    # She was awake and listening when the question was asked.
+    session._mic_mode = "capture"
+    # Even when her clock has run on, a step that is still waiting keeps her
+    # awake, because the answer to it is spoken.
+    session._mic_last_voice = time.monotonic() - 999
+    chunk(int16_chunk(0), FakeRecognizer(results=[]), state)
+    events = session.drain()
+    asleep = [
+        event
+        for event in events
+        if event.get("type") == "mic_state" and event.get("state") == "wake"
+    ]
+    check("she stays awake while a step is waiting", not asleep, str(events))
+
+    # Once the step has timed out, she goes back to sleep.
+    session._pending_deadline = time.monotonic() - 1.0
+    session._mic_last_voice = time.monotonic() - 999
+    chunk(int16_chunk(0), FakeRecognizer(results=[]), state)
+    events = session.drain()
+    asleep = [
+        event
+        for event in events
+        if event.get("type") == "mic_state" and event.get("state") == "wake"
+    ]
+    check("she goes back to sleep once the step has timed out", len(asleep) == 1, str(events))
+
+
+def test_the_next_step_gets_its_own_window():
+    """Every step waits for its own answer, for its own silence window."""
+    import session as sm
+
+    session = BrainSession()
+    ran: list[str] = []
+    original_run = sm._run_action
+    sm._run_action = lambda action: ran.append(str(action.get("path", ""))) or "done"
+    try:
+        session._finalise_plan(
+            {
+                "reply": "Here is the plan.",
+                "actions": [
+                    {"type": "write_file", "path": "one.txt", "content": "1"},
+                    {"type": "write_file", "path": "two.txt", "content": "2"},
+                ],
+            },
+            speak=False,
+        )
+        # The first step is answered with only a moment of its window left.
+        session._pending_deadline = time.monotonic() + 0.5
+        session._say("haan")
+        session.handle({"command": "route", "text": "haan", "mode": "auto", "speak": False})
+        check("the first step ran", ran == ["one.txt"], str(ran))
+        check(
+            "the next step waits for its own answer",
+            session._pending_deadline > time.monotonic() + sm.APPROVAL_SECONDS - 2.0,
+            str(session._pending_deadline),
+        )
+        # The first answer cannot answer the second question as well.
+        session.handle({"command": "route", "text": "haan", "mode": "auto", "speak": False})
+        check("the old answer did not run the next step", ran == ["one.txt"], str(ran))
+    finally:
+        sm._run_action = original_run
 
 
 def main():
@@ -1055,6 +1471,19 @@ def main():
     test_a_long_silence_puts_her_back_to_sleep()
     test_the_voice_model_is_kept_between_microphone_sessions()
     test_entrypoint_pumps_outbox_events()
+    test_approval_decision_phrases()
+    test_approval_phrases_need_whole_words()
+    test_mode_switch_phrases()
+    test_a_step_waits_for_a_spoken_answer()
+    test_a_copied_template_slot_is_never_spoken()
+    test_only_the_voice_can_approve_a_step()
+    test_only_a_word_the_microphone_heard_can_approve()
+    test_an_unrelated_request_drops_the_waiting_step()
+    test_a_step_can_be_declined()
+    test_a_waiting_step_times_out()
+    test_a_step_still_hears_the_answer_after_a_slow_model_call()
+    test_the_microphone_stays_awake_while_a_step_is_waiting()
+    test_the_next_step_gets_its_own_window()
     test_entrypoint_starts_without_a_sys_path_patch()
     test_entrypoint_reports_a_ready_router()
     test_entrypoint_serves_a_local_request()

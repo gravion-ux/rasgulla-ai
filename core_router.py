@@ -28,7 +28,8 @@ import requests
 
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _PROVIDER_RE = re.compile(
-    r"(?:nvidia\s+nim|nvidia\s+ai|nim\s+api|nim\s+agent|nvidia\b|\bnim\b)",
+    r"(?:nvidia\s+nim|nvidia\s+ai|nim\s+api|nim\s+agent|nvidia\b|\bnim\b|"
+    r"google\s+ai|gemini\b|ai\s+studio\b|openrouter|open\s+router)",
     re.IGNORECASE,
 )
 _MODEL_PREFIX_RE = re.compile(r"^[a-z0-9._-]+/", re.IGNORECASE)
@@ -70,6 +71,42 @@ class ModelUnavailable(RouterError):
 
 class RateLimited(RouterError):
     pass
+
+
+class ProviderRejected(RouterError):
+    """Raised when a provider's key is rejected (401/403)."""
+
+
+class Provider:
+    """A model provider with endpoint, key, and free model tracking."""
+
+    def __init__(self, name: str, config: dict[str, Any]) -> None:
+        self.name = name
+        self.endpoint = str(config.get("endpoint", "") or "")
+        self.key_env = [str(k) for k in config.get("key_env", [])]
+        self.free_suffix = config.get("free_suffix", "")
+        self.free_models: set[str] = set(config.get("free_models", []))
+        self.key = ""
+        self.disabled = False  # Set after first 403
+
+    def model_is_free(self, model_id: str) -> bool:
+        """Check if a model ID qualifies as free for this provider."""
+        if model_id in self.free_models:
+            return True
+        return bool(self.free_suffix and model_id.endswith(self.free_suffix))
+
+    def resolve_key(self, root_key: str) -> str:
+        """The key this provider should use, or an empty string when it has none.
+
+        A provider that shares the app's own key variable may fall back to the
+        key the user entered at runtime.  A provider with its own key variable
+        needs that key; without it the provider is simply skipped.
+        """
+        if self.key:
+            return self.key
+        if root_key and "RASGULLA_API_KEY" in self.key_env:
+            return root_key
+        return ""
 
 
 def read_api_key(env_names: Iterable[str]) -> str:
@@ -421,6 +458,43 @@ def _salvage_actions(raw: str) -> list[Any]:
     return actions
 
 
+_TEMPLATE_SLOT_RE = re.compile(r"^<[^<>\n]{4,160}>$")
+
+# The line the parser uses when a model hands back no answer at all.  It is
+# the parser's own words, so it never counts as an answer the model gave.
+NO_ANSWER_LINE = "I prepared a response."
+
+
+def is_template_slot(text: str) -> bool:
+    """True when the model copied a placeholder from the answer template.
+
+    A weak model sometimes quotes the template back instead of filling it in.
+    Such a slot is not an answer, so it must never be shown or spoken.
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    if _TEMPLATE_SLOT_RE.match(stripped):
+        return True
+    return stripped.lower().startswith("<the actual words")
+
+
+def plan_is_usable(text: str) -> bool:
+    """True when a model answer can be shown to the user as an answer.
+
+    A plan that carries real steps is usable even when the wording is poor,
+    because the steps are the work.  Otherwise the reply has to carry words
+    the model actually wrote.
+    """
+    plan = parse_json_plan(text)
+    if plan.get("actions"):
+        return True
+    if plan.get("_template"):
+        return False
+    reply = str(plan.get("reply") or "").strip()
+    return bool(reply) and reply != NO_ANSWER_LINE
+
+
 def parse_json_plan(raw: str) -> dict[str, Any]:
     """Parse the model's JSON reply, tolerating fences and stray prose.
 
@@ -481,6 +555,7 @@ def parse_json_plan(raw: str) -> dict[str, Any]:
             "clarify": clarify.strip() if clarify else None,
             "actions": actions,
             "_warning": warning,
+            "_template": is_template_slot(reply),
         }
 
     reply = parsed.get("reply")
@@ -493,7 +568,7 @@ def parse_json_plan(raw: str) -> dict[str, Any]:
                 reply = value
                 break
     if not isinstance(reply, str) or not reply.strip():
-        reply = "I prepared a response."
+        reply = NO_ANSWER_LINE
     mode = str(parsed.get("mode", "normal")).lower().strip()
     if mode not in TaskClassifier.MODE_TO_TIER:
         mode = "normal"
@@ -509,6 +584,7 @@ def parse_json_plan(raw: str) -> dict[str, Any]:
         "clarify": clarify.strip() if clarify else None,
         "actions": actions,
         "_warning": "",
+        "_template": is_template_slot(reply),
     }
 
 
@@ -544,6 +620,16 @@ class ModelRouter:
         self.last_model: str | None = None
         self.last_tier: str | None = None
         self.last_latency: float = 0.0
+
+        # Load providers for multi-endpoint routing
+        self.providers: dict[str, Provider] = {}
+        for name, prov_config in raw.get("providers", {}).items():
+            if isinstance(prov_config, dict):
+                self.providers[name] = Provider(name, prov_config)
+        # Initialize provider keys from API key
+        for provider in self.providers.values():
+            if provider.key_env:
+                provider.key = read_api_key(provider.key_env)
 
     @staticmethod
     def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
@@ -592,6 +678,9 @@ class ModelRouter:
                 self._cooldown[model] = time.monotonic() + float(self.defaults.get("cooldown_rate_limit_seconds", 90))
             elif isinstance(error, ModelTimeout):
                 self._cooldown[model] = time.monotonic() + float(self.defaults.get("cooldown_timeout_seconds", 300))
+            elif isinstance(error, ProviderRejected):
+                # Mark model as unavailable when provider key is rejected
+                self._disabled.add(model)
             else:
                 self._cooldown[model] = time.monotonic() + 30.0
 
@@ -609,6 +698,7 @@ class ModelRouter:
         messages: list[dict[str, Any]],
         image: str | None,
         timeout_override: float | None = None,
+        provider_override: str | None = None,
     ) -> tuple[str, dict[str, int], float]:
         # A health probe passes its own short timeout, so the startup check
         # cannot hang for the full per-model timeout of a slow model.
@@ -646,10 +736,25 @@ class ModelRouter:
         else:
             payload_messages[user_index] = {"role": "user", "content": content}
 
+        # Select endpoint and key based on provider
+        endpoint = self.endpoint
+        api_key = self.key
+        if provider_override and provider_override in self.providers:
+            provider = self.providers[provider_override]
+            if provider.disabled:
+                raise ProviderRejected("that endpoint is switched off")
+            if provider.endpoint:
+                endpoint = provider.endpoint
+            api_key = provider.resolve_key(self.key)
+            if not api_key:
+                # No key for this provider: it is skipped, not guessed at.
+                # The message stays brand free, because it can be read.
+                raise ProviderRejected("that endpoint has no key")
+
         started = time.monotonic()
         response = requests.post(
-            self.endpoint,
-            headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"},
+            endpoint,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
                 "model": model,
                 "temperature": float(spec.get("temperature", 0.4)),
@@ -661,6 +766,11 @@ class ModelRouter:
         elapsed = time.monotonic() - started
         if response.status_code == 429:
             raise RateLimited("rate limited")
+        if response.status_code == 401 or response.status_code == 403:
+            # 401/403 indicates provider key rejection - disable this provider
+            if provider_override and provider_override in self.providers:
+                self.providers[provider_override].disabled = True
+            raise ProviderRejected("invalid credentials")
         if response.status_code in (404, 410):
             # 410 Gone means the model was removed from the endpoint.  Treat it
             # like a missing model so the router retires it instead of
@@ -676,7 +786,10 @@ class ModelRouter:
             raise RouterError("empty response")
         message = choices[0].get("message") or {}
         text = message.get("content") or ""
-        if not text.strip() and message.get("reasoning_content"):
+        # Fallback to reasoning field when content is null or empty
+        if not text.strip() and message.get("reasoning"):
+            text = message.get("reasoning", "")
+        elif not text.strip() and message.get("reasoning_content"):
             text = message["reasoning_content"]
         usage = body.get("usage") or {}
         return text, {
@@ -692,15 +805,20 @@ class ModelRouter:
         healthy model is left in place.  Safe to call from a background thread.
         """
         results: dict[str, str] = {}
-        models: list[str] = []
+        # Extract model IDs from chain entries (support both string and dict formats)
+        probes: list[tuple[str, str | None]] = []
         for spec in self.tiers.values():
             chain = spec.get("chain", [])
-            # Only the first choice of each tier is probed up front; the rest
-            # are discovered lazily the first time they are actually needed.
-            for model in chain[:1]:
-                if model not in models:
-                    models.append(model)
-        for model in models:
+            for entry in chain[:1]:
+                if isinstance(entry, dict):
+                    model = entry.get("model", "")
+                    provider = entry.get("provider")
+                else:
+                    model = entry
+                    provider = None
+                if model and all(model != known for known, _ in probes):
+                    probes.append((model, provider))
+        for model, provider in probes:
             probe_spec = {
                 "temperature": 0.0,
                 "max_tokens": 4,
@@ -714,6 +832,7 @@ class ModelRouter:
                     [{"role": "user", "content": "OK"}],
                     None,
                     timeout_override=timeout,
+                    provider_override=provider,
                 )
                 results[model] = "ready"
             except ModelUnavailable:
@@ -728,6 +847,9 @@ class ModelRouter:
             except ModelTimeout:
                 results[model] = "timeout"
                 self._handle_failure(model, ModelTimeout("model timed out"))
+            except ProviderRejected:
+                results[model] = "rejected"
+                self._handle_failure(model, ProviderRejected("provider rejected"))
             except RouterError:
                 results[model] = "error"
             except Exception:
@@ -743,14 +865,28 @@ class ModelRouter:
     ) -> dict[str, Any]:
         """Run the tier's model chain, falling back when a model fails."""
         spec = self.tiers.get(tier) or self.tiers.get("chat", {})
-        chain: list[str] = list(spec.get("chain", []))
+        raw_chain = spec.get("chain", [])
+        # Parse chain entries - support both string and dict formats
+        chain: list[tuple[str, str | None]] = []  # (model, provider)
+        for entry in raw_chain:
+            if isinstance(entry, dict):
+                chain.append((entry.get("model", ""), entry.get("provider")))
+            else:
+                chain.append((entry, None))
+        chain = [(m, p) for m, p in chain if m]  # Filter empty models
         limit = min(int(self.defaults.get("max_attempts_per_request", 3)), max(1, len(chain)))
         attempts: list[str] = []
         failures: list[str] = []
 
-        for model in chain[:limit]:
+        for model, provider in chain[:limit]:
             if not self._available(model):
                 failures.append(f"{self.label(model)} is cooling down")
+                continue
+            if provider in self.providers and not self.providers[provider].model_is_free(model):
+                # Only free models are ever called, so the app can never
+                # spend money on a paid endpoint by accident.
+                failures.append(f"{self.label(model)} is not a free model")
+                attempts.append(self.label(model))
                 continue
             attempt_messages = messages
             if extra_instructions:
@@ -761,7 +897,9 @@ class ModelRouter:
                 attempt_messages = list(messages[:position]) + [brief] + list(messages[position:])
             try:
                 self.limiter.acquire()
-                text, usage, elapsed = self._request(model, spec, attempt_messages, image)
+                text, usage, elapsed = self._request(
+                    model, spec, attempt_messages, image, provider_override=provider
+                )
             except requests.Timeout as error:
                 failure = ModelTimeout(f"{self.label(model)} timed out")
                 self._handle_failure(model, failure)
@@ -778,6 +916,16 @@ class ModelRouter:
             except Exception as error:
                 failure = RouterError(f"{self.label(model)}: {type(error).__name__}")
                 self._handle_failure(model, failure)
+                self.usage.record(model, error=True, route=tier)
+                failures.append(redact(str(failure)))
+                attempts.append(self.label(model))
+                continue
+
+            if not plan_is_usable(text):
+                # The model answered with a copied template slot or with
+                # nothing at all.  That is not an answer, so the chain moves
+                # on to the next free model instead of showing it.
+                failure = RouterError(f"{self.label(model)} gave no usable answer")
                 self.usage.record(model, error=True, route=tier)
                 failures.append(redact(str(failure)))
                 attempts.append(self.label(model))

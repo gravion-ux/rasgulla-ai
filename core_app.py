@@ -279,7 +279,7 @@ MODE_PROMPTS = {
 ACTION_SCHEMA = """Return ONLY valid JSON with this exact shape:
 {
   "mode": "<normal|coder|music|writer|redteam>",
-  "reply": "<the actual words Rasgulla says to the user, written fresh for this request>",
+  "reply": "",
   "clarify": null,
   "actions": [
     {"type": "launch", "app": "<calculator|notepad|files|browser|paint|terminal>"},
