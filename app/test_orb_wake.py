@@ -11,7 +11,11 @@ It drives the real app in ``--probe-wake`` mode and checks five links:
 - the brain really listens (levels arrive) and says she is asleep,
 - a wake event puts her awake,
 - a greeting event carries something to say,
-- the orb speaks the greeting and captions it.
+- the orb speaks the greeting, captions it, and leaves it on the screen.
+
+The greeting is over in a second or two, so the probe watches every quarter
+of a second and remembers what it saw, instead of hoping to catch one lucky
+second.
 
 It needs the microphone, so it is kept out of the fast smoke gate.
 """
@@ -140,13 +144,23 @@ def main() -> int:
     )
     check(
         "the orb starts speaking",
-        wake.get("phase") == "speaking",
+        wake.get("spoke") is True,
         str(wake),
     )
     check(
         "the greeting is captioned on the orb",
-        len(str(wake.get("captionText", "")).strip()) > 0,
-        str(wake),
+        "awaake" in str(wake.get("captionSeen", "")).lower(),
+        str(wake.get("captionSeen")),
+    )
+    check(
+        "the greeting stays on screen",
+        "awaake" in str(wake.get("replyText", "")).lower(),
+        str(wake.get("replyText")),
+    )
+    check(
+        "the greeting is really played",
+        float(wake.get("audioTime", 0)) > 0,
+        str(wake.get("audioTime")),
     )
     check("the app exited cleanly", returncode == 0, f"exit={returncode}")
     if returncode != 0:

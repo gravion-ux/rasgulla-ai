@@ -125,7 +125,27 @@ def main() -> int:
     check("there is no headline strip", orb.get("hasStrip") is False, str(orb))
     check("there is no plan card", orb.get("hasPlanCard") is False, str(orb))
     check("there is no confirm card", orb.get("hasConfirmCard") is False, str(orb))
+    # The reply area is not a chat panel: it only holds what she just said,
+    # it has no input and it is not a card.
+    check("there is a reply area for the text", orb.get("hasReplyArea") is True, str(orb))
+    check("there is a pin button", orb.get("hasPinButton") is True, str(orb))
     check("the orb is clickable", orb.get("orbCursor") == "pointer", str(orb))
+
+    window = probe.get("window", {})
+    check("she starts pinned on top", window.get("pinBefore") is True, str(window))
+    check("the pin takes her off the top", window.get("pinAfter") is False, str(window))
+    check("the pin gives her back the top", window.get("pinBack") is True, str(window))
+    check(
+        "the pin button shows the state",
+        window.get("pinPressed") == "false",
+        str(window),
+    )
+    check(
+        "closing her window hides her instead of killing her",
+        window.get("hiddenOnClose") is True,
+        str(window),
+    )
+    check("she has a tray to live in", window.get("trayReady") is True, str(window))
 
     brain = probe.get("brain", {})
     check("the brain child is alive", brain.get("alive") is True, str(brain))

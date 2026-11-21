@@ -72,6 +72,20 @@ body {
   background: rgba(255, 255, 255, 0.18);
 }
 
+/* The pin says whether she floats above the other windows.  Unpinned, it is
+   dimmed, so the state is visible at a glance. */
+.shell-header button[aria-pressed="false"] {
+  opacity: 0.42;
+}
+
+.shell-header button[aria-pressed="false"]:hover {
+  opacity: 0.75;
+}
+
+.shell-header button svg {
+  display: block;
+}
+
 /* The three phases are indicators, not buttons: they only show where the
    orb currently is. */
 .pill {
@@ -101,13 +115,54 @@ body {
 }
 
 speaking-orb {
-  display: block;
-  /* auto margins centre the face in whatever space is left under the
-     header and the phase row */
-  margin: auto;
-  width: 260px;
-  height: 260px;
+  display: flex;
+  flex-direction: column;
+  /* The host clips its own painting (`contain: layout paint`), so it has to
+     be big enough to hold the face AND the caption underneath it.  It used to
+     be exactly as tall as the face, which painted the caption into the clip
+     and made the reply text invisible.  It now holds the face and the live
+     caption, and the reply itself lives in the pane below it. */
+  width: 100%;
+  flex: 0 0 auto;
+  height: 320px;
+  /* the face stays a square of this size, centred inside the wider host */
+  --orb-size: 260px;
   cursor: pointer;
   --cap: #f4eef5;
   --cap-size: 20px;
+}
+
+/* The reply she just gave, in full.  The caption under the face follows the
+   words while she talks and is gone a moment later, so this is where the
+   answer stays, where it can be read, copied and scrolled through. */
+.reply {
+  flex: 1 1 0;
+  min-height: 0;
+  margin: 0 12px 12px;
+  padding: 10px 12px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: left;
+  user-select: text;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+}
+
+.reply:empty {
+  display: none;
+}
+
+.reply::-webkit-scrollbar {
+  width: 5px;
+}
+
+.reply::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 3px;
 }

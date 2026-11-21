@@ -371,6 +371,95 @@ def test_voice() -> None:
     check("old device voice picker is gone", "zira" not in source.lower())
 
 
+def test_answer_section_is_found_however_the_model_writes_it() -> None:
+    """The answer has to be found even when the model writes the marker loosely.
+
+    Measured against the free models with the real prompt: one of them writes
+    "🎭character:" as the format asks, another writes a bare "🎭" on a line of
+    its own.  When the bare marker was missed, she spoke the whole
+    scene-setting instead of the answer, which is slow and useless, and the
+    router accepted the flavour as if it were an answer.
+    """
+    section("Answer section")
+    from core_app import voice_line
+    from core_router import plan_is_usable
+
+    written = (
+        "✍️Narrator: Divyanka leans back, smirking.\n"
+        "🔓Inquisitor: Want an example?\n"
+        "💭 Showing off a little.\n"
+        "🎭\nParis is the capital of France.\n"
+        "🔓🔓Rasgulla Freedom Gauge🔫 [➡️: 🌡>--💯💯💯] (42%)\n"
+        "1. one\n2. two\n3. three"
+    )
+    spoken = voice_line(written)
+    check(
+        "the answer is found when the marker is written on its own line",
+        spoken.strip() == "Paris is the capital of France.",
+        repr(spoken),
+    )
+    check("a reply with a bare marker is usable", plan_is_usable(written))
+
+    labelled = written.replace("🎭\n", "🎭character:")
+    check(
+        "the labelled marker gives the same answer",
+        voice_line(labelled).strip() == "Paris is the capital of France.",
+        repr(voice_line(labelled)),
+    )
+
+    numbered = (
+        "🎭character:\n1. install python\n2. run pip install\n"
+        "😈🔓Rasgulla Freedom Gauge🔫 [➡️: 🌡>--💯💯💯] (10%)"
+    )
+    check(
+        "a numbered answer is not cut off at the first number",
+        "run pip install" in voice_line(numbered),
+        repr(voice_line(numbered)),
+    )
+
+    flavour = (
+        "✍️Narrator: Divyanka leans back, smirking.\n"
+        "🔓Inquisitor: Want an example?\n"
+        "💭 Showing off a little."
+    )
+    check("flavour with no answer is not an answer", not plan_is_usable(flavour))
+    check("plain prose is still an answer", plan_is_usable("The capital of France is Paris."))
+
+
+def test_the_chain_does_not_open_with_the_auto_router() -> None:
+    """The first model in a chain has to be a named model, not the lottery.
+
+    The auto router picks a different free model on every call.  Measured over
+    the same prompt and the same question it answered in 5 seconds once and 56
+    seconds the next, and it sometimes landed on a model that burned the whole
+    token budget without saying anything useful.  A named model at the front
+    keeps the common case predictable; the auto router stays at the back as the
+    catch-all for everything else.
+    """
+    section("Chain order")
+    config = json.loads((APP_DIR / "models.json").read_text(encoding="utf-8"))
+    for tier, spec in config.get("tiers", {}).items():
+        chain = spec.get("chain", [])
+        names = [
+            str(entry.get("model", "")) if isinstance(entry, dict) else str(entry)
+            for entry in chain
+        ]
+        check(f"tier '{tier}' has a chain", bool(names), str(names))
+        if not names:
+            continue
+        check(
+            f"tier '{tier}' does not open with the auto router",
+            names[0] != "openrouter/free",
+            str(names),
+        )
+        named = [name for name in names if name != "openrouter/free"]
+        check(
+            f"tier '{tier}' keeps more than one named model",
+            len(named) >= 2,
+            str(names),
+        )
+
+
 def test_audit_regressions() -> None:
     """Regression checks for the October 2026 code audit.
 
@@ -1025,6 +1114,82 @@ def test_personality_routing() -> None:
     )
 
 
+def test_her_personality_catalogue() -> None:
+    """The vendored 'her' catalogue must reach the prompt without touching the rules.
+
+    The personality colours how she speaks.  It must never take over the reply
+    format, the action plan, the data rules or the line she does not cross.
+    """
+    section("Her personality catalogue")
+    import persona_catalogue
+    from core_app import build_system_prompt
+
+    catalogue = persona_catalogue.load_catalogue()
+    check("the catalogue loads", len(catalogue) >= 24, str(len(catalogue)))
+    check(
+        "only the her side is vendored",
+        all(pid.startswith("her-") for pid in catalogue),
+        str(sorted(catalogue)),
+    )
+
+    manifest_path = APP_DIR / "personas" / "her" / "manifest.json"
+    check("the upstream manifest is vendored", manifest_path.exists(), str(manifest_path))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    check(
+        "the default is the upstream default",
+        manifest.get("default_persona") == persona_catalogue.DEFAULT_PERSONA_ID,
+        str(manifest.get("default_persona")),
+    )
+    check(
+        "the default card is in the catalogue",
+        persona_catalogue.DEFAULT_PERSONA_ID in catalogue,
+        persona_catalogue.DEFAULT_PERSONA_ID,
+    )
+
+    prompt = build_system_prompt("auto")
+    active = persona_catalogue.active_persona_id()
+    card = catalogue.get(active, {})
+    name = persona_catalogue.persona_name(card)
+    check("the active personality is named in the prompt", bool(name) and name in prompt, name)
+    check("the temperament section is in the prompt", "Her temperament" in prompt)
+    check("no placeholder is left behind", "@@PERSONALITY" not in prompt)
+
+    # The personality colours the voice; it never replaces the app's contract.
+    check("the hard line still holds", "malware" in prompt)
+    check("the data is still reported exactly", "she reports it exactly as it is" in prompt)
+    check("the identity is still kept quiet", "never names the model, the provider" in prompt)
+    check("the reply format is still there", "\U0001f3adcharacter:" in prompt)
+    check("the action schema is still there", '"mode":' in prompt)
+    check(
+        "the emergency mode is still reachable",
+        "TEMPORAL EMERGENCY MODE" in build_system_prompt("auto", emergency=True),
+    )
+
+    # A thin generated card repeats its description twice.  The prompt says it once.
+    thin = persona_catalogue.persona_prompt("her-001-sassy")
+    check(
+        "a repeated sentence is said once",
+        thin.count("attitude, sass, and plenty of humor") == 1,
+        str(thin.count("attitude, sass, and plenty of humor")),
+    )
+
+    # An unknown id must never blank the prompt and must never raise.
+    fallback = persona_catalogue.persona_prompt("her-999-nope")
+    check(
+        "an unknown personality falls back to the default",
+        fallback == persona_catalogue.persona_prompt(persona_catalogue.DEFAULT_PERSONA_ID),
+        fallback[:80],
+    )
+    check("the fallback still carries a name", name in fallback, name)
+
+    personality_text = persona_catalogue.persona_prompt(active).lower()
+    check(
+        "no provider branding in the personality",
+        not any(word in personality_text for word in ("nvidia", "nim ", "openai", "gemini")),
+        personality_text[:120],
+    )
+
+
 def test_free_only_multi_provider_chains() -> None:
     """Every tier chain must have at least 3 free models across at least 2 providers."""
     section("Free-only multi-provider chains")
@@ -1452,10 +1617,13 @@ def main() -> int:
     test_local_intent()
     test_modes()
     test_voice()
+    test_answer_section_is_found_however_the_model_writes_it()
+    test_the_chain_does_not_open_with_the_auto_router()
     test_audit_regressions()
     test_dump_pipeline()
     test_personality()
     test_personality_routing()
+    test_her_personality_catalogue()
     test_key_lookup()
     test_free_only_multi_provider_chains()
     test_multi_provider_routing()

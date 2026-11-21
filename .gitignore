@@ -4,6 +4,7 @@ __pycache__/
 app/node_modules/
 work/
 usage.json
+persona_state.json
 *.log
 .DS_Store
 Thumbs.db

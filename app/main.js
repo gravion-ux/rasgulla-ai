@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, protocol, net } = require('electron');
+const { app, BrowserWindow, ipcMain, protocol, net, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const { pathToFileURL } = require('url');
@@ -17,6 +17,7 @@ const LIVE_PROBE_MODE = process.argv.includes('--probe-live');
 const SHOT_MODE = process.argv.includes('--probe-shot');
 const TALK_MODE = process.argv.includes('--probe-talk');
 const WAKE_MODE = process.argv.includes('--probe-wake');
+const CAPTION_MODE = process.argv.includes('--probe-caption');
 
 let orbWindow = null;
 let brainProcess = null;
@@ -25,6 +26,10 @@ let shuttingDown = false;
 let pendingId = 0;
 const pending = new Map();
 const served = { orbScript: false };
+// The tray she lives in when the window is closed, and whether she is pinned
+// on top of the other windows.  She starts pinned, the way she always was.
+let tray = null;
+let pinned = true;
 // The last greeting the brain sent, so a probe can look at what she said.
 let lastGreeting = null;
 // The last complaint the brain made, and the tail of its log, so a probe
@@ -225,7 +230,7 @@ function createOrbWindow() {
     show: false,
     frame: false,
     transparent: true,
-    alwaysOnTop: true,
+    alwaysOnTop: pinned,
     skipTaskbar: true,
     resizable: false,
     backgroundColor: '#00000000',
@@ -240,10 +245,75 @@ function createOrbWindow() {
   orbWindow.once('ready-to-show', () => {
     orbWindow.show();
   });
+  orbWindow.on('close', (event) => {
+    // Closing her window does not kill her: she goes into the tray and keeps
+    // listening.  Only a real quit closes the window for good.
+    if (shuttingDown) return;
+    event.preventDefault();
+    orbWindow.hide();
+    ensureTray();
+  });
   orbWindow.on('closed', () => {
     orbWindow = null;
     stopBrain();
   });
+}
+
+// The tray icon is drawn pixel by pixel, so the app carries no image file.
+function orbIcon() {
+  const size = 32;
+  const buffer = Buffer.alloc(size * size * 4);
+  const middle = (size - 1) / 2;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = x - middle;
+      const dy = y - middle;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      const index = (y * size + x) * 4;
+      let alpha = 0;
+      if (distance > size * 0.3 && distance < size * 0.47) alpha = 255; // the ring
+      else if (distance < size * 0.18) alpha = 210; // the core
+      buffer[index] = 36; // blue
+      buffer[index + 1] = 165; // green
+      buffer[index + 2] = 245; // red
+      buffer[index + 3] = alpha;
+    }
+  }
+  return nativeImage.createFromBitmap(buffer, { width: size, height: size });
+}
+
+function ensureTray() {
+  if (tray) return tray;
+  tray = new Tray(orbIcon());
+  tray.setToolTip('Rasgulla');
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: 'Show Rasgulla', click: () => showOrb() },
+      { type: 'separator' },
+      { label: 'Quit', click: () => quitApp() },
+    ])
+  );
+  tray.on('click', () => showOrb());
+  return tray;
+}
+
+function showOrb() {
+  if (!orbWindow || orbWindow.isDestroyed()) {
+    createOrbWindow();
+    return;
+  }
+  orbWindow.show();
+  orbWindow.focus();
+}
+
+function quitApp() {
+  shuttingDown = true;
+  stopBrain();
+  if (tray) {
+    tray.destroy();
+    tray = null;
+  }
+  app.quit();
 }
 
 function stopBrain() {
@@ -268,14 +338,21 @@ app.whenReady().then(async () => {
     await runTalkProbe();
   } else if (WAKE_MODE) {
     await runWakeProbe();
+  } else if (CAPTION_MODE) {
+    await runCaptionProbe();
   } else if (PROBE_MODE) {
     await runProbe();
   }
 });
 
 app.on('window-all-closed', () => {
+  // With the tray she stays alive even when her window is gone.
+  if (!tray && process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  shuttingDown = true;
   stopBrain();
-  if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('activate', () => {
@@ -288,6 +365,24 @@ ipcMain.handle('brain:send', async (_event, payload) => {
   return sendToBrain(payload);
 });
 
+// The window controls.  The close button puts her in the tray, and the pin
+// decides whether she floats above the other windows.
+ipcMain.handle('app:hide', async () => {
+  if (orbWindow && !orbWindow.isDestroyed()) {
+    orbWindow.hide();
+    ensureTray();
+  }
+  return true;
+});
+
+ipcMain.handle('app:toggle-pin', async () => {
+  pinned = !pinned;
+  if (orbWindow && !orbWindow.isDestroyed()) orbWindow.setAlwaysOnTop(pinned);
+  return pinned;
+});
+
+ipcMain.handle('app:is-pinned', async () => pinned);
+
 // -- probe mode ---------------------------------------------------------------
 //
 // `electron . --probe` runs the real app, looks inside the renderer and
@@ -298,6 +393,7 @@ const ORB_PROBE = `(() => {
   const orb = document.getElementById("orb");
   const brand = document.getElementById("brand");
   const phases = document.querySelectorAll(".pill button");
+  const pin = document.getElementById("btnPin");
   return {
     elementDefined: Boolean(customElements.get("speaking-orb")),
     rendererRan: window.__rasgullaRendererReady === true,
@@ -310,6 +406,8 @@ const ORB_PROBE = `(() => {
     hasStrip: Boolean(document.querySelector(".strip")),
     hasPlanCard: Boolean(document.getElementById("plan-card")),
     hasConfirmCard: Boolean(document.getElementById("confirm-card")),
+    hasReplyArea: Boolean(document.getElementById("reply")),
+    hasPinButton: Boolean(pin),
     orbCursor: orb ? getComputedStyle(orb).cursor : null
   };
 })()`;
@@ -428,6 +526,145 @@ async function runShotProbe() {
   app.exit(0);
 }
 
+const CAPTION_PROBE = `(() => {
+  const host = document.getElementById("orb");
+  const root = host ? host.shadowRoot : null;
+  const cap = root ? root.querySelector(".cap") : null;
+  const orbDiv = root ? root.querySelector(".orb") : null;
+  const reply = document.getElementById("reply");
+  if (!host || !cap) return { error: "no caption" };
+  const rect = (el) => {
+    const r = el.getBoundingClientRect();
+    return {
+      x: +r.x.toFixed(1), y: +r.y.toFixed(1),
+      w: +r.width.toFixed(1), h: +r.height.toFixed(1),
+      top: +r.top.toFixed(1), bottom: +r.bottom.toFixed(1),
+      left: +r.left.toFixed(1), right: +r.right.toFixed(1)
+    };
+  };
+  const hostRect = rect(host);
+  const capRect = rect(cap);
+  const orbRect = rect(orbDiv);
+  const replyRect = reply ? rect(reply) : null;
+  return {
+    host: hostRect,
+    cap: capRect,
+    orb: orbRect,
+    reply: replyRect,
+    capText: cap.textContent.trim(),
+    capFontSize: getComputedStyle(cap).fontSize,
+    hostContain: getComputedStyle(host).contain,
+    capScrollHeight: cap.scrollHeight,
+    capClientHeight: cap.clientHeight,
+    capOverflowY: getComputedStyle(cap).overflowY,
+    insideHost: capRect.top >= hostRect.top - 0.5 && capRect.bottom <= hostRect.bottom + 0.5,
+    overflowBy: +(capRect.bottom - hostRect.bottom).toFixed(1),
+    replyText: reply ? reply.textContent.trim() : "",
+    replyScrollHeight: reply ? reply.scrollHeight : 0,
+    replyClientHeight: reply ? reply.clientHeight : 0,
+    replyOverflowY: reply ? getComputedStyle(reply).overflowY : "",
+    replyInsideWindow: replyRect
+      ? replyRect.top >= -0.5 && replyRect.bottom <= innerHeight + 0.5
+      : false,
+    viewport: { w: innerWidth, h: innerHeight, dpr: devicePixelRatio }
+  };
+})()`;
+
+// A real answer, taken from an actual reply, so the probe measures what the
+// user really reads rather than a toy line.
+const CAPTION_ANSWER =
+  "Here is the Python function to reverse a string:\n\n" +
+  "def reverse_string(s):\n" +
+  "    return s[::-1]\n\n" +
+  "s[::-1] walks the string backwards, so the original one is left alone.";
+
+// A dump is longer than the space under the face, so it has to scroll rather
+// than be painted into the clip and lost.
+const CAPTION_DUMP = Array.from(
+  { length: 24 },
+  (_, index) => `line ${String(index + 1).padStart(2, "0")}: the quick brown fox jumps over the lazy dog`
+).join("\n");
+
+async function measureCaption(caseName, line) {
+  // The reply is handed to the renderer the way the brain hands it over, so
+  // the probe measures the real path and not a hand-made DOM.
+  const driven = await orbWindow.webContents.executeJavaScript(`(() => {
+    if (typeof window.__rasgullaMessage !== "function") {
+      return { ok: false, why: "the renderer has no message hook" };
+    }
+    window.__rasgullaMessage({
+      type: "plan",
+      reply: ${JSON.stringify(line)},
+      caption: ${JSON.stringify(line)},
+      speech: "",
+      audio: "",
+      words: [],
+      mime: ""
+    });
+    return { ok: true };
+  })()`);
+  if (!driven || !driven.ok) {
+    return { error: (driven && driven.why) || "the renderer did not take the reply" };
+  }
+  await sleep(900);
+
+  const layout = await orbWindow.webContents.executeJavaScript(CAPTION_PROBE);
+  if (layout.error) return { error: layout.error };
+
+  const image = await orbWindow.webContents.capturePage();
+  const size = image.getSize();
+  const bitmap = image.toBitmap();
+  // A picture of the real reply, for the record.
+  const shotIndex = process.argv.indexOf('--shot');
+  if (caseName === 'answer' && shotIndex > 0 && process.argv[shotIndex + 1]) {
+    require('fs').writeFileSync(process.argv[shotIndex + 1], image.toPNG());
+    console.log(`RASGULLA_SHOT ${process.argv[shotIndex + 1]}`);
+  }
+  const scale = size.width / layout.viewport.w;
+  const brightIn = (rect) => {
+    if (!rect) return 0;
+    const x0 = Math.max(0, Math.round(rect.left * scale));
+    const x1 = Math.min(size.width, Math.round(rect.right * scale));
+    const y0 = Math.max(0, Math.round(rect.top * scale));
+    const y1 = Math.min(size.height, Math.round(rect.bottom * scale));
+    let bright = 0;
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = (y * size.width + x) * 4;
+        // the bitmap is BGRA: the text is a pale near-white on a dark page
+        if (bitmap[i + 2] > 110 && bitmap[i + 1] > 110 && bitmap[i] > 110) bright += 1;
+      }
+    }
+    return bright;
+  };
+  return {
+    ...layout,
+    case: caseName,
+    drivenText: line,
+    scale: +scale.toFixed(3),
+    imageSize: size,
+    brightPixels: brightIn(layout.cap),
+    replyBrightPixels: brightIn(layout.reply)
+  };
+}
+
+// The caption has to be visible, not merely present in the DOM.  The old
+// probe only read cap.textContent, so a caption painted outside the host's
+// clip still passed.  This one measures the box and counts the pixels that
+// were actually drawn.
+async function runCaptionProbe() {
+  await waitForLoad(orbWindow);
+  await sleep(3000);
+
+  const answer = await measureCaption("answer", CAPTION_ANSWER);
+  const dump = answer.error ? { error: answer.error } : await measureCaption("dump", CAPTION_DUMP);
+
+  const caption = { answer, dump };
+  console.log(`RASGULLA_CAPTION ${JSON.stringify(caption)}`);
+  stopBrain();
+  app.exit(answer.error || dump.error ? 1 : 0);
+}
+
 const TALK_PROBE = `(() => {
   const orb = document.getElementById("orb");
   const cap = orb && orb.shadowRoot ? orb.shadowRoot.querySelector(".cap") : null;
@@ -520,9 +757,15 @@ const WAKE_PROBE = `(() => {
   const orb = document.getElementById("orb");
   const cap = orb && orb.shadowRoot ? orb.shadowRoot.querySelector(".cap") : null;
   const active = document.querySelector('.pill button[aria-pressed="true"]');
+  const reply = document.getElementById("reply");
+  const audio = document.getElementById("voice");
+  const log = Array.isArray(window.__rasgullaCaptionLog) ? window.__rasgullaCaptionLog : [];
   return {
     phase: active ? active.textContent.trim().toLowerCase() : null,
     captionText: cap ? cap.textContent : "",
+    captionSeen: log.join(" | "),
+    replyText: reply ? reply.textContent.trim() : "",
+    audioTime: audio ? Number(audio.currentTime) || 0 : 0,
     micMode: typeof window.__rasgullaGetMicMode === "function" ? window.__rasgullaGetMicMode() : null
   };
 })()`;
@@ -557,15 +800,25 @@ async function runWakeProbe() {
   await sendToBrain({ command: 'wake', source: 'voice' });
 
   let phase = null;
+  let spoke = false;
   let captionText = '';
+  let captionSeen = '';
+  let replyText = '';
+  let audioTime = 0;
   let micMode = null;
-  for (let i = 0; i < 40; i++) {
-    await sleep(1000);
+  // The greeting is over in a second or two, so the probe looks often and
+  // remembers what it saw, instead of hoping to catch one lucky second.
+  for (let i = 0; i < 160; i++) {
+    await sleep(250);
     const state = await orbWindow.webContents.executeJavaScript(WAKE_PROBE);
     phase = state.phase;
+    if (state.phase === 'speaking') spoke = true;
     captionText = state.captionText;
+    captionSeen = state.captionSeen;
+    replyText = state.replyText;
+    audioTime = Math.max(audioTime, state.audioTime);
     micMode = state.micMode;
-    if (phase === 'speaking' && captionText.trim().length > 0) break;
+    if (captionSeen.trim() && replyText.trim()) break;
   }
 
   const wake = {
@@ -578,7 +831,11 @@ async function runWakeProbe() {
     greetingAudio: Boolean(lastGreeting && lastGreeting.audio),
     greetingSpeech: lastGreeting ? String(lastGreeting.speech || '') : '',
     phase: phase,
+    spoke: spoke,
     captionText: captionText,
+    captionSeen: captionSeen,
+    replyText: replyText,
+    audioTime: audioTime,
     micMode: micMode,
     errors: brainCounts.error,
     lastError: lastBrainError,
@@ -590,8 +847,9 @@ async function runWakeProbe() {
       brainCounts.greeting - greetingsBefore >= 1 &&
       lastGreeting &&
       lastGreeting.audio &&
-      phase === 'speaking' &&
-      captionText.trim().length > 0
+      spoke &&
+      captionSeen.trim().length > 0 &&
+      replyText.trim().length > 0
     ),
   };
   console.log(`RASGULLA_WAKE ${JSON.stringify(wake)}`);
@@ -651,6 +909,43 @@ async function runProbe() {
   }
   console.log('RASGULLA_PROBE_STEP done');
 
+  // The window controls: she starts pinned on top, the pin button takes that
+  // away and gives it back, and closing her window puts her in the tray
+  // instead of killing her.
+  const pinBefore = orbWindow.isAlwaysOnTop();
+  await orbWindow.webContents.executeJavaScript(
+    'document.getElementById("btnPin").click()'
+  );
+  await sleep(500);
+  const pinAfter = orbWindow.isAlwaysOnTop();
+  const pinPressed = await orbWindow.webContents.executeJavaScript(
+    'document.getElementById("btnPin").getAttribute("aria-pressed")'
+  );
+  await orbWindow.webContents.executeJavaScript(
+    'document.getElementById("btnPin").click()'
+  );
+  await sleep(500);
+  const pinBack = orbWindow.isAlwaysOnTop();
+
+  await orbWindow.webContents.executeJavaScript(
+    'document.getElementById("btnClose").click()'
+  );
+  await sleep(800);
+  const hidden = orbWindow.isVisible() === false;
+  const trayAfterClose = Boolean(tray);
+  orbWindow.show();
+  await sleep(300);
+
+  probe.window = {
+    pinBefore: pinBefore,
+    pinAfter: pinAfter,
+    pinBack: pinBack,
+    pinPressed: pinPressed,
+    hiddenOnClose: hidden,
+    trayReady: trayAfterClose,
+    trayAtStart: Boolean(tray),
+  };
+
   probe.ok = Boolean(
     probe.windows.orb &&
     probe.windows.count === 1 &&
@@ -665,7 +960,15 @@ async function runProbe() {
     probe.orb.hasStrip === false &&
     probe.orb.hasPlanCard === false &&
     probe.orb.hasConfirmCard === false &&
+    probe.orb.hasReplyArea === true &&
+    probe.orb.hasPinButton === true &&
     probe.orb.orbCursor === 'pointer' &&
+    probe.window.pinBefore === true &&
+    probe.window.pinAfter === false &&
+    probe.window.pinBack === true &&
+    probe.window.pinPressed === 'false' &&
+    probe.window.hiddenOnClose === true &&
+    probe.window.trayReady === true &&
     probe.brain.alive &&
     probe.brain.type === 'ready' &&
     probe.brain.configError === '' &&

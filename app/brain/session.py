@@ -34,8 +34,17 @@ for _p in (str(PROJECT_ROOT), str(BRAIN_DIR)):
 
 import pyautogui
 
+from persona_catalogue import (
+    PersonaError,
+    active_persona_id,
+    catalogue_summaries,
+    persona_summary,
+    resolve_persona,
+    set_active_persona,
+)
 from core_app import (
     WORK_DIR,
+    caption_line,
     freedom_gauge,
     local_intent,
     parse_json_plan,
@@ -205,6 +214,15 @@ def mode_switch(text: str) -> str | None:
     if any(phrase in normalized for phrase in REDTEAM_ON_PHRASES):
         return "redteam"
     return None
+
+
+def persona_switch(text: str) -> str | None:
+    """Return the personality id a sentence is asking for, else None.
+
+    Only a phrase that asks for a change may change her: a bare name inside an
+    ordinary sentence is just a name.
+    """
+    return resolve_persona(text)
 
 
 # Voice approval phrases for agentic action execution.
@@ -511,6 +529,7 @@ class BrainSession:
             "listen": self._cmd_listen,
             "wake": self._cmd_wake,
             "usage": self._cmd_usage,
+            "persona": self._cmd_persona,
         }
         handler = handlers.get(kind)
         if handler is None:
@@ -566,6 +585,29 @@ class BrainSession:
             self.router.key = self.key
         return {"type": "ok", "key_found": bool(self.key)}
 
+    def _cmd_persona(self, command: dict[str, Any]) -> dict[str, Any]:
+        """Report the personality catalogue, or change the active one."""
+        wanted = str(command.get("persona", "")).strip()
+        if wanted:
+            try:
+                set_active_persona(wanted)
+            except PersonaError:
+                return {
+                    "type": "error",
+                    "message": f"there is no personality called {wanted!r}",
+                    "persona": active_persona_id(),
+                }
+        active = active_persona_id()
+        current = persona_summary(active)
+        return {
+            "type": "ok",
+            "persona": active,
+            "name": current.get("name", ""),
+            "tagline": current.get("tagline", ""),
+            "archetype": current.get("archetype", ""),
+            "catalogue": catalogue_summaries(),
+        }
+
     # -- request path ------------------------------------------------------
 
     def _cmd_route(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -580,6 +622,25 @@ class BrainSession:
             self.mode = mode_override
             spoken = "Red team mode on." if mode_override == "redteam" else "Back to normal mode."
             return self._plan_payload(spoken, speak=speak, route={"tier": mode_override, "label": mode_override, "seconds": 0.0})
+
+        # A spoken request for a different personality changes how she answers
+        # from the very next request on.  It never reaches the model.
+        personality = persona_switch(text)
+        if personality:
+            try:
+                set_active_persona(personality)
+            except PersonaError:
+                pass
+            else:
+                card = persona_summary(personality)
+                spoken = (
+                    f"{card.get('name') or personality} it is. I'll speak like that from now on."
+                )
+                return self._plan_payload(
+                    spoken,
+                    speak=speak,
+                    route={"tier": "local", "label": "persona", "seconds": 0.0},
+                )
 
         # A spoken approval only ever runs a step that is waiting for one.
         if self._pending_actions and self._pending_index < len(self._pending_actions):
@@ -760,6 +821,10 @@ class BrainSession:
         payload: dict[str, Any] = {
             "type": "plan",
             "reply": reply,
+            # The caption is the answer, and it is built here rather than taken
+            # from the synthesised speech, so the reply is still on the screen
+            # when the voice engine is down.
+            "caption": caption_line(reply),
             "speech": "",
             "audio": "",
             "words": [],

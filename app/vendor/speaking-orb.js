@@ -84,9 +84,11 @@
   };
 
   const CSS = `:host{display:block;width:100%;position:relative;contain:layout paint;--cap:#fff;--cap-dim:rgba(255,255,255,.52)}
-    .orb{position:relative;width:100%;aspect-ratio:1}
+    .orb{position:relative;width:100%;max-width:var(--orb-size,100%);margin:0 auto;aspect-ratio:1;flex:0 0 auto}
     canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
-    .cap{position:relative;margin:-4% auto 0;width:var(--cap-w,92%);min-height:2.7em;text-align:center;font:600 var(--cap-size,24px)/1.3 var(--cap-font,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif);letter-spacing:-.01em;color:var(--cap);text-wrap:balance}
+    .cap{position:relative;margin:-4% auto 10px;width:var(--cap-w,92%);min-height:2.7em;flex:1 1 auto;overflow-y:auto;overflow-x:hidden;overflow-wrap:anywhere;text-align:center;font:600 var(--cap-size,24px)/1.3 var(--cap-font,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif);letter-spacing:-.01em;color:var(--cap);text-wrap:balance}
+    .cap::-webkit-scrollbar{width:4px;height:4px}
+    .cap::-webkit-scrollbar-thumb{background:rgba(255,255,255,.22);border-radius:2px}
     .cap.user{--cap:#ffd6a8;font-weight:500}
     .cap span{display:inline-block;white-space:pre;will-change:opacity,transform}
     canvas.fx{pointer-events:none}`;

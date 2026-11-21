@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0.0",
+  "title": "Her Catalogue",
+  "subtitle": "24 personality profiles for female AI companions",
+  "description": "A collection of 24 distinct female AI companion personalities, each with unique traits, voice bindings, and relationship dynamics.",
+  "catalogue": "her",
+  "default_persona": "her-001-sassy",
+  "default_locale": "en_US",
+  "persona_count": 24,
+  "version": "1.0.0",
+  "theme": {
+    "--primary": "#e94560",
+    "--secondary": "#f5c6c8",
+    "--bg": "#1a1a2e",
+    "--fg": "#eaeaea",
+    "--accent": "#e94560"
+  },
+  "onboarding": "Welcome to the Her Catalogue. Your AI companion will be a female persona with distinct personality traits, moods, and relationship dynamics. Each persona has a unique voice and emotional baseline. Select your preferred personality or let the system match you."
+}

@@ -289,6 +289,53 @@ def test_voice_line_split():
     check("voice_line extracts character only", line == "this is spoken", repr(line))
 
 
+def test_the_caption_does_not_need_the_voice():
+    """The reply has to reach the screen even when the voice engine is down.
+
+    The caption is built from the reply in the brain, so a machine with no
+    voice still shows the answer instead of leaving the user with a silent
+    orb and nothing to read.
+    """
+    import session as session_module
+
+    reply = (
+        "✍️Narrator: scene\n"
+        "🔓Inquisitor: q?\n"
+        "🎭character: the answer that has to be on the screen\n"
+        "😈🔓Rasgulla Freedom Gauge🔫 [x] (50%)\n"
+        "1. a\n2. b\n3. c"
+    )
+    saved = session_module.TTS_AVAILABLE
+    session_module.TTS_AVAILABLE = False
+    try:
+        brain = BrainSession()
+        payload = brain._plan_payload(reply, speak=True)
+    finally:
+        session_module.TTS_AVAILABLE = saved
+
+    caption = str(payload.get("caption", ""))
+    check(
+        "the caption is there without a voice",
+        "the answer that has to be on the screen" in caption,
+        repr(caption),
+    )
+    check(
+        "the caption is the answer, not the flavour",
+        "Narrator" not in caption and "Inquisitor" not in caption,
+        repr(caption),
+    )
+    check(
+        "there is no audio without a voice",
+        payload.get("audio") == "",
+        repr(payload.get("audio")),
+    )
+    check(
+        "the whole reply is still on screen",
+        "the answer that has to be on the screen" in str(payload.get("reply", "")),
+        repr(payload.get("reply")),
+    )
+
+
 # -- voice resolution --------------------------------------------------------
 #
 # The default preset has to sound natural: English uses the lively Indian
@@ -1083,6 +1130,61 @@ def test_mode_switch_phrases():
         check(f"'{phrase}' returns None", result is None, f"got {result}")
 
 
+def test_persona_switch_phrases():
+    """A spoken request can change which personality she speaks with."""
+    try:
+        from session import persona_switch
+    except ImportError:
+        check("persona_switch function exists", False, "no persona_switch in session.py")
+        return
+
+    check("'switch to serene' picks the serene card", persona_switch("switch to serene") == "her-002-serene", str(persona_switch("switch to serene")))
+    check("'act like warm emma' picks the warm card", persona_switch("act like warm emma") == "her-004-warm", str(persona_switch("act like warm emma")))
+    check("'persona sassy' picks the sassy card", persona_switch("persona sassy") == "her-001-sassy", str(persona_switch("persona sassy")))
+    check("'switch to her-014-intellectual' picks that card", persona_switch("switch to her-014-intellectual") == "her-014-intellectual", str(persona_switch("switch to her-014-intellectual")))
+
+    # An ordinary request is never a switch, and a bare name is not enough:
+    # only a phrase that asks for a change may change her.
+    for phrase in ["what time is it", "tell me about luna", "who is serene", "write a character description"]:
+        result = persona_switch(phrase)
+        check(f"'{phrase}' is not a switch", result is None, f"got {result}")
+
+
+def test_the_persona_command_switches_and_reports():
+    """The brain can report the catalogue and change the active personality."""
+    import persona_catalogue
+
+    session = BrainSession()
+    original = persona_catalogue.active_persona_id()
+    try:
+        reply = session.handle({"command": "persona"})
+        check("the command is answered", reply.get("type") == "ok", str(reply))
+        check("the active personality is named", bool(reply.get("persona")), str(reply))
+        listed = reply.get("catalogue") or []
+        check("the whole catalogue is listed", len(listed) >= 24, str(len(listed)))
+
+        reply = session.handle({"command": "persona", "persona": "her-002-serene"})
+        check("the personality switched", reply.get("persona") == "her-002-serene", str(reply))
+        check(
+            "the new personality is the active one",
+            persona_catalogue.active_persona_id() == "her-002-serene",
+            persona_catalogue.active_persona_id(),
+        )
+
+        reply = session.handle({"command": "persona", "persona": "her-999-nope"})
+        check("an unknown personality is refused", reply.get("type") == "error", str(reply))
+        check(
+            "the refusal changed nothing",
+            persona_catalogue.active_persona_id() == "her-002-serene",
+            persona_catalogue.active_persona_id(),
+        )
+
+        reply = session.handle({"command": "persona"})
+        check("the refusal did not change the active one", reply.get("persona") == "her-002-serene", str(reply))
+    finally:
+        persona_catalogue.set_active_persona(original)
+
+
 def test_a_step_waits_for_a_spoken_answer():
     """A planned step must not run before the user says yes."""
     import session as sm
@@ -1449,6 +1551,7 @@ def main():
     test_validate_actions_through_shim()
     test_rejects_unsafe_action()
     test_voice_line_split()
+    test_the_caption_does_not_need_the_voice()
     test_auto_preset_uses_the_lively_english_voice()
     test_hello_reports_the_resolved_voice_id()
     test_mic_chunk_emits_a_level_event()
@@ -1474,6 +1577,8 @@ def main():
     test_approval_decision_phrases()
     test_approval_phrases_need_whole_words()
     test_mode_switch_phrases()
+    test_persona_switch_phrases()
+    test_the_persona_command_switches_and_reports()
     test_a_step_waits_for_a_spoken_answer()
     test_a_copied_template_slot_is_never_spoken()
     test_only_the_voice_can_approve_a_step()

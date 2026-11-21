@@ -464,6 +464,36 @@ _TEMPLATE_SLOT_RE = re.compile(r"^<[^<>\n]{4,160}>$")
 # the parser's own words, so it never counts as an answer the model gave.
 NO_ANSWER_LINE = "I prepared a response."
 
+# The reply format asks for "🎭character:", but the free models write the
+# marker in several ways: "🎭character:", "🎭:" and a bare "🎭" on a line of
+# its own.  When the bare marker was missed, she spoke the whole
+# scene-setting instead of the answer, which is slow and useless, and the
+# router accepted the flavour as if it were an answer.  The marker is
+# therefore matched loosely, and the answer ends at the gauge line.
+_ANSWER_MARKER_RE = re.compile("\U0001F3AD\\s*(?:character)?\\s*:?", re.IGNORECASE)
+# The gauge and the choices belong to the screen, not to the answer.
+_REPLY_END_MARKERS = ("\U0001F608", "\U0001F513")
+# The narrator, the inquisitor and the thoughts are flavour around the answer.
+_FLAVOUR_MARKER_RE = re.compile("[\u270d\U0001F513\U0001F4AD]")
+
+
+def answer_section(text: str) -> str:
+    """The part of a reply that carries the answer, however the model marked it.
+
+    Returns an empty string when the reply has no answer section at all.
+    """
+    raw = str(text or "")
+    match = _ANSWER_MARKER_RE.search(raw)
+    if not match:
+        return ""
+    tail = raw[match.end():]
+    cut = len(tail)
+    for marker in _REPLY_END_MARKERS:
+        index = tail.find(marker)
+        if index != -1:
+            cut = min(cut, index)
+    return tail[:cut].strip()
+
 
 def is_template_slot(text: str) -> bool:
     """True when the model copied a placeholder from the answer template.
@@ -485,6 +515,10 @@ def plan_is_usable(text: str) -> bool:
     A plan that carries real steps is usable even when the wording is poor,
     because the steps are the work.  Otherwise the reply has to carry words
     the model actually wrote.
+
+    A reply that used the reply format has to carry the answer section too.
+    Flavour on its own is not an answer, so the chain moves on to the next
+    model instead of showing three lines of scene-setting and no answer.
     """
     plan = parse_json_plan(text)
     if plan.get("actions"):
@@ -492,7 +526,13 @@ def plan_is_usable(text: str) -> bool:
     if plan.get("_template"):
         return False
     reply = str(plan.get("reply") or "").strip()
-    return bool(reply) and reply != NO_ANSWER_LINE
+    if not reply or reply == NO_ANSWER_LINE:
+        return False
+    if answer_section(reply):
+        return True
+    # The reply used the reply format but carried no answer: that is
+    # flavour, not an answer.
+    return not (_ANSWER_MARKER_RE.search(reply) or _FLAVOUR_MARKER_RE.search(reply))
 
 
 def parse_json_plan(raw: str) -> dict[str, Any]:

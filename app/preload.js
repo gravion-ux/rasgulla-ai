@@ -15,4 +15,10 @@ contextBridge.exposeInMainWorld('rasgulla', {
     ipcRenderer.on('brain:log', subscription);
     return () => ipcRenderer.off('brain:log', subscription);
   },
+  // The window itself: the close button puts her in the tray instead of
+  // killing her, and the pin decides whether she stays on top of the other
+  // windows.
+  hideApp: () => ipcRenderer.invoke('app:hide'),
+  togglePin: () => ipcRenderer.invoke('app:toggle-pin'),
+  isPinned: () => ipcRenderer.invoke('app:is-pinned'),
 });

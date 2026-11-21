@@ -1,10 +1,11 @@
 {
   "_comment": "Free-endpoint model routing with multi-provider fallback. Chains use dict entries {provider, model} for multi-endpoint routing.",
+  "_chain_note": "The first entry of every chain is a named model, never the auto router. Measured over the real prompt: the auto router answered once in 5.07s and the next time in 31.83s, and it sometimes landed on a model that burned the whole token budget without saying anything useful. The named models at the front were measured at 2.88s, 4.90s, 6.41s and 8.75s, and they sit in three separate rate-limit pools so one pool being busy cannot stop the app. The auto router stays at the back as the catch-all.",
   "endpoint": "https://openrouter.ai/api/v1/chat/completions",
   "key_env": ["RASGULLA_API_KEY", "OPENROUTER_API_KEY"],
   "defaults": {
     "requests_per_minute": 20,
-    "timeout_seconds": 90,
+    "timeout_seconds": 60,
     "deep_timeout_seconds": 200,
     "cooldown_rate_limit_seconds": 90,
     "cooldown_timeout_seconds": 300,
@@ -34,9 +35,10 @@
       "temperature": 0.55,
       "max_tokens": 4000,
       "chain": [
-        {"provider": "openrouter", "model": "openrouter/free"},
-        {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-        {"provider": "openrouter", "model": "nemotron-3.5-lightning:free"}
+        {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+        {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
+        {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"},
+        {"provider": "openrouter", "model": "openrouter/free"}
       ]
     },
     "code": {
@@ -44,9 +46,10 @@
       "temperature": 0.2,
       "max_tokens": 4000,
       "chain": [
-        {"provider": "openrouter", "model": "openrouter/free"},
-        {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-        {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"}
+        {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+        {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
+        {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"},
+        {"provider": "openrouter", "model": "openrouter/free"}
       ]
     },
     "reason": {
@@ -54,9 +57,10 @@
       "temperature": 0.25,
       "max_tokens": 4000,
       "chain": [
-        {"provider": "openrouter", "model": "openrouter/free"},
-        {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-        {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"}
+        {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+        {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
+        {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"},
+        {"provider": "openrouter", "model": "openrouter/free"}
       ]
     },
     "vision": {
@@ -64,9 +68,10 @@
       "temperature": 0.2,
       "max_tokens": 2500,
       "chain": [
-        {"provider": "openrouter", "model": "openrouter/free"},
         {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-        {"provider": "openrouter", "model": "particle-ai/particle-1:free"}
+        {"provider": "openrouter", "model": "nvidia/nemotron-3.5-super-vl:free"},
+        {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+        {"provider": "openrouter", "model": "openrouter/free"}
       ]
     },
     "creative": {
@@ -74,9 +79,10 @@
       "temperature": 0.9,
       "max_tokens": 4000,
       "chain": [
-        {"provider": "openrouter", "model": "openrouter/free"},
-        {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-        {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"}
+        {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+        {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
+        {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"},
+        {"provider": "openrouter", "model": "openrouter/free"}
       ]
     },
     "security": {
@@ -84,15 +90,18 @@
       "temperature": 0.3,
       "max_tokens": 4000,
       "chain": [
-        {"provider": "openrouter", "model": "openrouter/free"},
-        {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-        {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"}
+        {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+        {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
+        {"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b"},
+        {"provider": "openrouter", "model": "openrouter/free"}
       ]
     }
   },
   "aliases": {
     "openrouter/free": "Auto",
     "nvidia/nemotron-3-ultra-550b-a55b": "Lightning",
+    "nvidia/nemotron-3-ultra-550b-a55b:free": "Lightning",
+    "nvidia/nemotron-3.5-super-vl:free": "Vantage",
     "gemini-3.5-flash-lite": "Lumen",
     "gemini-3.1-flash-lite": "Beacon",
     "gemini-flash-lite-latest": "Spark",
