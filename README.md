@@ -1,5 +1,9 @@
 # Rasgulla AI
 
+![Demo](docs/demo.png)
+
+*Demo: Local-first static risk analysis of a project tree.*
+
 > A local-first AI-assisted security research workbench for code understanding, safe test generation, and reproducible debugging.
 
 **Status:** MVP scaffold / research prototype. Not production-certified.
