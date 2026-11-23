@@ -1,5 +1,7 @@
 # Rasgulla AI
 
+[![CI](https://github.com/gravion-ux/rasgulla-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/gravion-ux/rasgulla-ai/actions/workflows/ci.yml)
+
 ![Demo](docs/demo.png)
 
 *Demo: Local-first static risk analysis of a project tree.*
