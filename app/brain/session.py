@@ -1099,7 +1099,7 @@ class BrainSession:
                 "score": self._active_skill.score,
             }
 
-        return self._plan_payload(
+        payload = self._plan_payload(
             f"{reply}\n\n{question}" if question else reply,
             speak=speak,
             route=plan.get("_route", {}),
@@ -1109,6 +1109,10 @@ class BrainSession:
             speech_extra=question,
             skill=skill_payload,
         )
+        # The playbook belongs to this plan only.  It is cleared here so a
+        # later plan can never be held by the last turn's skill.
+        self._active_skill = None
+        return payload
 
     # -- actions -----------------------------------------------------------
 
