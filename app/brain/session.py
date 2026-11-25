@@ -264,6 +264,29 @@ def approval_decision(text: str) -> str:
     return "other"
 
 
+# The words that finish a step the user ran by hand.
+#
+# "done" is in neither the approve nor the decline list, so the two
+# vocabularies cannot collide. They are only read while a step is waiting
+# for exactly this answer.
+DONE_PHRASES = ("done", "ho gaya", "done kar diya", "finished", "complete")
+
+_DONE_RE = _phrase_matcher(DONE_PHRASES)
+
+
+def done_decision(text: str) -> str:
+    """Return 'done', 'decline', or 'other' for a step the user ran by hand."""
+    normalized = str(text or "").strip()
+    if not normalized:
+        return "other"
+    # The decline wins a tie here too.
+    if _DECLINE_RE.search(normalized):
+        return "decline"
+    if _DONE_RE.search(normalized):
+        return "done"
+    return "other"
+
+
 # The words that start a held playbook.
 #
 # None of them contains an approve or a decline word on purpose: "run",
@@ -533,6 +556,9 @@ class BrainSession:
         # the user says the word.
         self._held_playbook: dict[str, Any] | None = None
         self._pending_manual: list[dict[str, Any]] = []
+        # "approve" waits for a yes or a no, "manual_done" waits for the
+        # user to say they finished a step she could not run.
+        self._pending_mode = "approve"
 
         try:
             self.router = ModelRouter(CONFIG_PATH, "", self.usage)
@@ -698,9 +724,15 @@ class BrainSession:
                     "That step timed out, so nothing ran. Say it again if you still want it.",
                     speak=speak,
                 )
-            decision = approval_decision(text)
-            if decision in ("approve", "decline"):
+            decision = (
+                done_decision(text)
+                if self._pending_mode == "manual_done"
+                else approval_decision(text)
+            )
+            if decision in ("approve", "decline", "done"):
                 if self._was_heard(text):
+                    if decision == "done":
+                        return self._finish_manual(speak=speak)
                     return self._advance_pending(decision, speak=speak)
                 # The microphone never heard this, so it cannot answer the
                 # question she asked.  Nothing runs and the step is dropped.
@@ -784,12 +816,23 @@ class BrainSession:
         self._pending_deadline = 0.0
         self.current_actions = []
         self._pending_manual = []
+        self._pending_mode = "approve"
 
     def _pending_question(self) -> str:
         """The question for the step that is waiting for an answer."""
         action = self._pending_actions[self._pending_index]
         step = self._pending_index + 1
+        if isinstance(action, dict) and action.get("type") == "manual":
+            return f"Step {step}: {self._describe_manual(action)}. Say haan and I'll hand it over."
         return f"Step {step}: {_describe_action(action)}. Run karun?"
+
+    def _describe_manual(self, step: dict[str, Any]) -> str:
+        """How a step the user has to run by hand is described."""
+        title = str(step.get("title") or "a command she cannot run").strip()
+        command = str(step.get("command") or "").strip()
+        if not command:
+            return f"{title}. No command was given, so there is nothing to run."
+        return f"{title}. This needs a command I cannot run: {command}"
 
     def _start_held_playbook(self, speak: bool) -> dict[str, Any]:
         """Arm the held plan, exactly like a plan that arrived from the model."""
@@ -802,22 +845,15 @@ class BrainSession:
                 "There is no playbook ready to start, so nothing ran.",
                 speak=speak,
             )
-        if not actions:
-            # There is nothing she may run, so nothing is armed: the steps go
-            # to the user by hand.
-            commands = "; ".join(
-                str(step.get("command") or "").strip()
-                for step in manual
-                if isinstance(step, dict) and str(step.get("command") or "").strip()
-            )
-            self._clear_pending()
-            self.current_actions = []
-            return self._plan_payload(
-                f"This playbook has no steps I can run. Please run these by hand: {commands}",
-                speak=speak,
-                speech_extra=f"Please run these by hand: {commands}",
-            )
-        self._pending_actions = actions
+        # The manual steps go into the same ordered list as the actions, so
+        # every step waits for its own answer, one at a time.
+        steps = list(actions)
+        for offset, entry in enumerate(
+            sorted(manual, key=lambda item: int(item.get("after", 0)))
+        ):
+            after = int(entry.get("after", 0)) + offset
+            steps.insert(min(max(after, 0), len(steps)), entry)
+        self._pending_actions = steps
         self._pending_manual = manual
         self._pending_index = 0
         self._arm_pending_step()
@@ -825,7 +861,7 @@ class BrainSession:
         return self._plan_payload(
             f"Starting the playbook. {question}",
             speak=speak,
-            actions=actions,
+            actions=steps,
             speech_extra=question,
         )
 
@@ -833,6 +869,21 @@ class BrainSession:
         """Run or skip the waiting step, then ask for the next one."""
         action = self._pending_actions[self._pending_index]
         if decision == "approve":
+            if isinstance(action, dict) and action.get("type") == "manual":
+                # She does not run it. She reads it out and hands it over.
+                hand_over = (
+                    f"{self._describe_manual(action)}. Please run this now. "
+                    "Say done when it is finished."
+                )
+                self._pending_mode = "manual_done"
+                # A new question, so a new window: the "done" has to be
+                # spoken after the hand-over, not before it.
+                self._arm_pending_step()
+                return self._plan_payload(
+                    hand_over,
+                    speak=speak,
+                    speech_extra=hand_over,
+                )
             try:
                 outcome = _run_action(action)
             except Exception:  # noqa: BLE001 - a failed step is reported, never fatal
@@ -851,7 +902,24 @@ class BrainSession:
             return self._plan_payload(done, speak=speak, results=list(self.action_results[-5:]))
 
         # The next step is a new question, so it gets its own window and its
-        # own answer.
+        # own answer, and it is approved the normal way again.
+        self._pending_mode = "approve"
+        self._arm_pending_step()
+        question = self._pending_question()
+        return self._plan_payload(f"Done. {question}", speak=speak)
+
+    def _finish_manual(self, speak: bool) -> dict[str, Any]:
+        """Record a step the user ran by hand and move to the next one."""
+        step = self._pending_actions[self._pending_index]
+        command = str(step.get("command") or "").strip() if isinstance(step, dict) else ""
+        self.action_results.append(f"Ran manually: {command}" if command else "Ran manually")
+        self._pending_index += 1
+        self.current_actions = list(self._pending_actions[self._pending_index :])
+        self._pending_mode = "approve"
+        if self._pending_index >= len(self._pending_actions):
+            self._clear_pending()
+            done = "All steps are done. " + "; ".join(self.action_results[-5:])
+            return self._plan_payload(done, speak=speak, results=list(self.action_results[-5:]))
         self._arm_pending_step()
         question = self._pending_question()
         return self._plan_payload(f"Done. {question}", speak=speak)
@@ -984,11 +1052,26 @@ class BrainSession:
             # A skill plan is held, not armed. Nothing waits for an answer
             # until the user says "follow the playbook", so a stray "haan"
             # can never fire it and the microphone stays free.
-            manual = [
-                step
-                for step in (plan.get("manual") or [])
-                if isinstance(step, dict) and str(step.get("command") or "").strip()
-            ]
+            manual = []
+            for entry in plan.get("manual") or []:
+                if not isinstance(entry, dict):
+                    continue
+                command = str(entry.get("command") or "").strip()
+                title = str(entry.get("title") or "A step for the user").strip()
+                if not command:
+                    continue
+                try:
+                    after = int(entry.get("after", len(valid)))
+                except (TypeError, ValueError):
+                    after = len(valid)
+                manual.append(
+                    {
+                        "type": "manual",
+                        "title": title,
+                        "command": command,
+                        "after": max(after, 0),
+                    }
+                )
             # Any step that was already waiting is dropped first: the new
             # plan is held, so nothing may stay armed behind it.
             self._clear_pending()

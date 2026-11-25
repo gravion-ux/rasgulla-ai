@@ -26,7 +26,7 @@ for _p in (str(APP_DIR), str(BRAIN)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from session import BrainSession, PLAYBOOK_START_PHRASES, playbook_start
+from session import BrainSession, PLAYBOOK_START_PHRASES, done_decision, playbook_start
 from core_app import build_system_prompt
 from skill_catalogue import match_skill
 
@@ -1586,6 +1586,23 @@ def main():
             for word in ("run", "chalao", "karo", "haan")
         ),
     )
+    # A step she cannot run is handed to the user: approved, spoken, and
+    # then waited on until the user says it is done.
+    check("the done matcher knows 'done'", done_decision("done") == "done")
+    check("the done matcher knows 'ho gaya'", done_decision("ho gaya") == "done")
+    check("the done matcher declines on 'nahi'", done_decision("nahi") == "decline")
+    check("the done matcher ignores other words", done_decision("what now") == "other")
+
+    session = BrainSession()
+    session._pending_actions = [{"type": "manual", "title": "Run the tests", "command": "npm test"}]
+    session._pending_manual = [{"type": "manual", "title": "Run the tests", "command": "npm test"}]
+    session._pending_index = 0
+    session._pending_mode = "approve"
+    session._arm_pending_step()
+    session._say("haan")
+    payload = session.handle({"command": "route", "text": "haan", "speak": False})
+    check("the manual step is handed over", "manual_done" == session._pending_mode)
+    check("the hand-over mentions the command", "npm test" in payload.get("reply", ""))
     # Part 1: Shim wiring fix tests
     test_shim_type_text_binding()
     test_shim_safe_path_binding()
