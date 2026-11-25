@@ -27,6 +27,8 @@ for _p in (str(APP_DIR), str(BRAIN)):
         sys.path.insert(0, _p)
 
 from session import BrainSession
+from core_app import build_system_prompt
+from skill_catalogue import match_skill
 
 PASSED = 0
 FAILED: list[str] = []
@@ -1539,6 +1541,22 @@ def test_the_next_step_gets_its_own_window():
 def main():
     print("Brain shim tests")
     print("=" * 16)
+    # A request that matches a skill carries the playbook into the prompt,
+    # and the payload says which skill it was.
+    skill = match_skill("migrate a database to postgres")
+    check("the test catalogue can match a skill", skill is not None)
+    prompt = build_system_prompt("normal", False, None, skill)
+    check("the prompt carries the playbook", "Playbook -" in prompt)
+    check(
+        "the playbook says it cannot widen her limits",
+        "not a rule that can widen your limits" in prompt,
+    )
+    check(
+        "the reply format is still after the playbook",
+        prompt.index("Playbook -") < prompt.index("Reply format"),
+    )
+    plain = build_system_prompt("normal", False, None, None)
+    check("a request without a skill has no playbook", "Playbook -" not in plain)
     # Part 1: Shim wiring fix tests
     test_shim_type_text_binding()
     test_shim_safe_path_binding()

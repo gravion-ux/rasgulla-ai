@@ -59,6 +59,7 @@ from core_router import (
     is_template_slot,
     read_api_key,
 )
+from skill_catalogue import SkillMatch, match_skill, skill_summary
 from voice_engine import (
     clean_for_speech,
     pick_voice,
@@ -502,6 +503,11 @@ class BrainSession:
         # a step, so the protocol on its own can never run an action.
         self._heard: list[str] = []
 
+        # The playbook that fits this request.  It is matched offline, so it
+        # costs no network call, and it is carried on the session so the
+        # prompt, the payload and the plan all talk about the same skill.
+        self._active_skill: SkillMatch | None = None
+
         try:
             self.router = ModelRouter(CONFIG_PATH, "", self.usage)
         except RouterError as error:
@@ -616,6 +622,11 @@ class BrainSession:
         speak = bool(command.get("speak", False))
         snapshot = command.get("snapshot")
 
+        # Every turn starts with no playbook.  A local answer (the time, a
+        # launcher word) never reaches the model, so it never gets one and
+        # never waits for one.
+        self._active_skill = None
+
         # Check for mode switch phrases before routing
         mode_override = mode_switch(text)
         if mode_override:
@@ -686,6 +697,10 @@ class BrainSession:
 
         forced = mode if mode != "auto" else "auto"
         tier = self.classifier.classify(text, has_image=bool(snapshot), forced_mode=forced)
+        # The playbook for this request.  It is matched offline, so it costs
+        # no network call, and it is carried on the session so the prompt,
+        # the payload and the plan all talk about the same skill.
+        self._active_skill = match_skill(text)
         messages = self._build_messages(text, mode)
         result = self.router.call(
             tier, messages, image=snapshot, extra_instructions=self._tier_brief(tier)
@@ -771,7 +786,12 @@ class BrainSession:
         emergency = request.strip().startswith(",,")
         from core_app import build_system_prompt
 
-        messages = [{"role": "system", "content": build_system_prompt(mode, emergency)}]
+        messages = [
+            {
+                "role": "system",
+                "content": build_system_prompt(mode, emergency, skill=self._active_skill),
+            }
+        ]
         recent = self.history[-8:]
         if recent and recent[-1]["role"] == "user" and recent[-1]["content"] == request:
             recent = recent[:-1]
@@ -807,6 +827,7 @@ class BrainSession:
         warning: str = "",
         results: list[str] | None = None,
         speech_extra: str = "",
+        skill: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the payload the renderer expects and speak it once.
 
@@ -836,6 +857,9 @@ class BrainSession:
             "descriptions": [_describe_action(action) for action in (actions or [])],
             "rejections": list(getattr(_shim, "action_rejections", [])),
             "results": list(results or []),
+            # The playbook that shaped this reply.  It is shown on screen and
+            # never spoken.
+            "skill": skill or {},
         }
         if not speak or not TTS_AVAILABLE:
             return payload
@@ -889,6 +913,14 @@ class BrainSession:
         else:
             self._clear_pending()
 
+        skill_payload: dict[str, Any] = {}
+        if self._active_skill is not None:
+            skill_payload = {
+                "name": self._active_skill.name,
+                "domain": self._active_skill.domain,
+                "score": self._active_skill.score,
+            }
+
         return self._plan_payload(
             f"{reply}\n\n{question}" if question else reply,
             speak=speak,
@@ -897,6 +929,7 @@ class BrainSession:
             clarify=plan.get("clarify"),
             warning=plan.get("_warning", ""),
             speech_extra=question,
+            skill=skill_payload,
         )
 
     # -- actions -----------------------------------------------------------
