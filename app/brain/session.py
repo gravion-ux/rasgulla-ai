@@ -264,6 +264,27 @@ def approval_decision(text: str) -> str:
     return "other"
 
 
+# The words that start a held playbook.
+#
+# None of them contains an approve or a decline word on purpose: "run",
+# "chalao", "karo" and "ha" already belong to the approval gate, and a start
+# phrase must never be read as an answer to a waiting step.
+PLAYBOOK_START_PHRASES = (
+    "follow the playbook",
+    "apply the playbook",
+    "start the playbook",
+    "begin the playbook",
+)
+
+
+def playbook_start(text: str) -> bool:
+    """True when a sentence asks for the held playbook to start."""
+    normalized = " ".join(re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).split())
+    if not normalized:
+        return False
+    return any(f" {phrase} " in f" {normalized} " for phrase in PLAYBOOK_START_PHRASES)
+
+
 class ClapDetector:
     """Counts claps.  Two claps in a row mean wake up.
 
@@ -508,6 +529,11 @@ class BrainSession:
         # prompt, the payload and the plan all talk about the same skill.
         self._active_skill: SkillMatch | None = None
 
+        # A skill plan is held, not armed: nothing waits for an answer until
+        # the user says the word.
+        self._held_playbook: dict[str, Any] | None = None
+        self._pending_manual: list[dict[str, Any]] = []
+
         try:
             self.router = ModelRouter(CONFIG_PATH, "", self.usage)
         except RouterError as error:
@@ -626,6 +652,17 @@ class BrainSession:
         # launcher word) never reaches the model, so it never gets one and
         # never waits for one.
         self._active_skill = None
+
+        # The playbook starts here, before everything else, so a start phrase
+        # can never be read as an answer to a waiting step and never
+        # re-matched against the catalogue.  It only fires when a plan is
+        # actually held and no step is waiting.
+        if (
+            self._held_playbook
+            and not self._pending_actions
+            and playbook_start(text)
+        ):
+            return self._start_held_playbook(speak=speak)
 
         # Check for mode switch phrases before routing
         mode_override = mode_switch(text)
@@ -746,12 +783,51 @@ class BrainSession:
         self._pending_index = 0
         self._pending_deadline = 0.0
         self.current_actions = []
+        self._pending_manual = []
 
     def _pending_question(self) -> str:
         """The question for the step that is waiting for an answer."""
         action = self._pending_actions[self._pending_index]
         step = self._pending_index + 1
         return f"Step {step}: {_describe_action(action)}. Run karun?"
+
+    def _start_held_playbook(self, speak: bool) -> dict[str, Any]:
+        """Arm the held plan, exactly like a plan that arrived from the model."""
+        held = self._held_playbook or {}
+        actions = list(held.get("actions") or [])
+        manual = list(held.get("manual") or [])
+        self._held_playbook = None
+        if not actions and not manual:
+            return self._plan_payload(
+                "There is no playbook ready to start, so nothing ran.",
+                speak=speak,
+            )
+        if not actions:
+            # There is nothing she may run, so nothing is armed: the steps go
+            # to the user by hand.
+            commands = "; ".join(
+                str(step.get("command") or "").strip()
+                for step in manual
+                if isinstance(step, dict) and str(step.get("command") or "").strip()
+            )
+            self._clear_pending()
+            self.current_actions = []
+            return self._plan_payload(
+                f"This playbook has no steps I can run. Please run these by hand: {commands}",
+                speak=speak,
+                speech_extra=f"Please run these by hand: {commands}",
+            )
+        self._pending_actions = actions
+        self._pending_manual = manual
+        self._pending_index = 0
+        self._arm_pending_step()
+        question = self._pending_question()
+        return self._plan_payload(
+            f"Starting the playbook. {question}",
+            speak=speak,
+            actions=actions,
+            speech_extra=question,
+        )
 
     def _advance_pending(self, decision: str, speak: bool) -> dict[str, Any]:
         """Run or skip the waiting step, then ask for the next one."""
@@ -904,7 +980,26 @@ class BrainSession:
         self.current_actions = valid
 
         question = ""
-        if valid:
+        if valid and self._active_skill is not None:
+            # A skill plan is held, not armed. Nothing waits for an answer
+            # until the user says "follow the playbook", so a stray "haan"
+            # can never fire it and the microphone stays free.
+            manual = [
+                step
+                for step in (plan.get("manual") or [])
+                if isinstance(step, dict) and str(step.get("command") or "").strip()
+            ]
+            # Any step that was already waiting is dropped first: the new
+            # plan is held, so nothing may stay armed behind it.
+            self._clear_pending()
+            self.current_actions = valid
+            self._held_playbook = {
+                "skill": self._active_skill.name,
+                "actions": list(valid),
+                "manual": manual,
+            }
+            question = "Say 'follow the playbook' when you want me to start."
+        elif valid:
             # The steps wait for a spoken answer before anything runs.
             self._pending_actions = list(valid)
             self._pending_index = 0

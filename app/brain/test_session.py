@@ -26,7 +26,7 @@ for _p in (str(APP_DIR), str(BRAIN)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from session import BrainSession
+from session import BrainSession, PLAYBOOK_START_PHRASES, playbook_start
 from core_app import build_system_prompt
 from skill_catalogue import match_skill
 
@@ -1557,6 +1557,35 @@ def main():
     )
     plain = build_system_prompt("normal", False, None, None)
     check("a request without a skill has no playbook", "Playbook -" not in plain)
+
+    # A skill plan is HELD, not armed: nothing waits for an answer until the
+    # user says the word.
+    session = BrainSession()
+    session._active_skill = match_skill("migrate a database to postgres")
+    session._finalise_plan(
+        {
+            "reply": "Here is the plan.\n\n🎭character: migrating now",
+            "actions": [{"type": "wait", "seconds": 1}],
+        },
+        speak=False,
+    )
+    check("a skill plan is not armed", session._pending_actions == [])
+    check("the skill plan is held", session._held_playbook is not None)
+    check(
+        "the held plan keeps its actions",
+        bool(session._held_playbook and session._held_playbook["actions"]),
+    )
+
+    # The trigger is checked before the approval block.
+    check("the trigger recognises the phrase", playbook_start("follow the playbook"))
+    check("the trigger ignores other words", not playbook_start("hello there"))
+    check(
+        "the trigger avoids the approve words",
+        all(
+            word not in " ".join(PLAYBOOK_START_PHRASES)
+            for word in ("run", "chalao", "karo", "haan")
+        ),
+    )
     # Part 1: Shim wiring fix tests
     test_shim_type_text_binding()
     test_shim_safe_path_binding()
