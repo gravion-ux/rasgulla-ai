@@ -13,6 +13,7 @@ const audio = document.getElementById('voice');
 const btnClose = document.getElementById('btnClose');
 const btnPin = document.getElementById('btnPin');
 const replyBox = document.getElementById('reply');
+const playbookChip = document.getElementById('playbook');
 
 let voiceUrl = null;
 // 'wake' while she sleeps, 'capture' while she listens to a command,
@@ -151,6 +152,21 @@ function showReply(text) {
   replyBox.scrollTop = 0;
 }
 
+// The playbook that shaped this reply. It is on screen and never spoken, so
+// the caption and the voice stay exactly as they are.
+function showPlaybook(skill) {
+  if (!playbookChip) return;
+  const name = skill && skill.name ? String(skill.name) : '';
+  if (!name) {
+    playbookChip.hidden = true;
+    playbookChip.textContent = '';
+    return;
+  }
+  playbookChip.textContent = `playbook: ${name}`;
+  playbookChip.title = skill.domain ? `${skill.name} - ${skill.domain}` : name;
+  playbookChip.hidden = false;
+}
+
 function handleMessage(message) {
   switch (message.type) {
     case 'ready':
@@ -189,6 +205,7 @@ function handleMessage(message) {
       // The reply stays on the screen in full, whatever its length.  The
       // caption carries the answer and keeps its formatting; the speech is
       // the fallback for a reply that came without one.
+      showPlaybook(message.skill);
       showReply(message.reply || message.caption || message.speech);
       speak(message.caption || message.speech || message.reply, message.audio, message.words, message.mime);
       break;
@@ -247,6 +264,7 @@ window.__rasgullaGetMicMode = () => micMode;
 // The caption probe hands a reply to the renderer this way, so it measures the
 // real path instead of a hand-made DOM.
 window.__rasgullaMessage = (message) => handleMessage(message);
+window.__rasgullaGetSkill = () => (playbookChip && !playbookChip.hidden ? playbookChip.textContent : '');
 
 rasgulla.sendToBrain({ command: 'hello' }).catch(() => {});
 // She sleeps with the microphone open, so the wake word is always heard.

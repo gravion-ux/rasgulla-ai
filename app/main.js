@@ -407,6 +407,7 @@ const ORB_PROBE = `(() => {
     hasPlanCard: Boolean(document.getElementById("plan-card")),
     hasConfirmCard: Boolean(document.getElementById("confirm-card")),
     hasReplyArea: Boolean(document.getElementById("reply")),
+    hasPlaybookChip: Boolean(document.getElementById("playbook")),
     hasPinButton: Boolean(pin),
     orbCursor: orb ? getComputedStyle(orb).cursor : null
   };

@@ -128,6 +128,7 @@ def main() -> int:
     # The reply area is not a chat panel: it only holds what she just said,
     # it has no input and it is not a card.
     check("there is a reply area for the text", orb.get("hasReplyArea") is True, str(orb))
+    check("the playbook chip exists", orb.get("hasPlaybookChip") is True, str(orb))
     check("there is a pin button", orb.get("hasPinButton") is True, str(orb))
     check("the orb is clickable", orb.get("orbCursor") == "pointer", str(orb))
 

@@ -158,6 +158,31 @@ speaking-orb {
   display: none;
 }
 
+/* The playbook that shaped this reply.  It is on screen and never spoken, so
+   the caption and the voice stay exactly as they are. */
+.playbook {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 6px;
+  padding: 3px 10px;
+  align-self: center;
+  border: 1px solid rgba(255, 190, 90, 0.45);
+  border-radius: 999px;
+  background: rgba(255, 176, 70, 0.12);
+  color: rgba(255, 214, 150, 0.92);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.playbook[hidden] {
+  display: none;
+}
+
 .reply::-webkit-scrollbar {
   width: 5px;
 }
