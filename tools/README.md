@@ -19,6 +19,7 @@ Run them with the project's own interpreter:
 | `live_probe_agentic.py` | The live agentic release: the spoken mode switch, a real request that comes back as a renderer-shaped plan with every action held back, and the voice gate approving, declining and refusing. The action runner is replaced with a recorder, so nothing touches the machine. |
 | `acceptance_probe.py` | The release criteria, offline, against the shipped code rather than a copy. |
 | `verify_plan_calibration.py` | The plan's calibration table against the real catalogue: what `match_skill()` returns for every query, whether the cached scorer agrees with upstream `route()`, and the cost of one match. |
+| `ab_skill_latency.py` | Whether the injected playbook pushes the live path past its latency budget. It sends the same request twice per round, once with the playbook in the system prompt and once without, so the difference between the paired times is the injection and everything else is the endpoint. Also prints how many tokens the playbook adds. |
 | `draft_skill_catalogue.py` | The catalogue module the plan describes, kept verbatim here so the calibration can be measured against the committed plan. |
 
 `verify_plan_calibration.py` compares against the vendored catalogue under
