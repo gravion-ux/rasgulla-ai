@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from .adapters import available_adapters, get_adapter
-from .analyzer import analyze_path
+from .analyzer import RULES, analyze_path
 
 EXIT_OK = 0
 EXIT_INVALID_INPUT = 1
@@ -20,8 +20,38 @@ EXIT_USAGE = 2
 NOTICE = (
     "Findings are heuristic hypotheses for human review. Rasgulla AI performs "
     "static inspection only: it does not execute code, exploit targets, access "
-    "networks, or collect credentials."
+    "networks, or collect credentials. Every finding carries a confidence, a "
+    "CWE, and — for the weaknesses that only exist in LLM-backed applications "
+    "— an OWASP Top 10 for LLM Applications category."
 )
+
+SEVERITIES = ("high", "medium", "low", "info")
+CONFIDENCES = ("high", "medium", "low")
+
+
+def _summary(findings: list[dict]) -> dict:
+    """Counts a reviewer can act on.
+
+    How many findings there are, how severe they are, how confident the
+    matcher is, and which OWASP LLM categories they fall into.
+    """
+    by_severity = {name: 0 for name in SEVERITIES}
+    by_confidence = {name: 0 for name in CONFIDENCES}
+    by_owasp: dict[str, int] = {}
+    for finding in findings:
+        severity = finding.get("severity", "medium")
+        by_severity[severity] = by_severity.get(severity, 0) + 1
+        confidence = finding.get("confidence", "medium")
+        by_confidence[confidence] = by_confidence.get(confidence, 0) + 1
+        category = finding.get("owasp_llm")
+        if category:
+            by_owasp[category] = by_owasp.get(category, 0) + 1
+    return {
+        "total": len(findings),
+        "by_severity": by_severity,
+        "by_confidence": by_confidence,
+        "by_owasp_llm": by_owasp,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,7 +105,9 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "tool": "Rasgulla AI",
         "mode": "static-analysis",
-        "schema_version": 1,
+        "schema_version": 2,
+        "summary": _summary(findings),
+        "rules": [rule.to_dict() for rule in RULES],
         "findings": findings,
         "notice": NOTICE,
     }

@@ -60,9 +60,21 @@ def test_an_empty_finding_list_produces_an_empty_plan():
 
 
 def test_every_rule_has_a_template():
+    """Every rule the analyzer can report has a test-plan template, so no
+    finding is ever silently dropped from the plan."""
     module = _testplan()
-    for rule_id in ("RG001", "RG002", "RG003", "RG004", "RG005", "RG006"):
-        template = module.RULE_TEMPLATES[rule_id]
+    analyzer = importlib.import_module("rasgulla.analyzer")
+    for rule in analyzer.RULES:
+        template = module.RULE_TEMPLATES[rule.rule_id]
         assert template["objective"]
         assert template["steps"]
         assert template["verification"]
+
+
+def test_a_plan_entry_carries_the_rule_metadata():
+    finding = _finding("RG007", "high", "agent.py", 9)
+    finding.update({"confidence": "medium", "cwe": "CWE-1427", "owasp_llm": "LLM01"})
+    plan = _testplan().build_test_plan([finding])
+    assert plan[0]["confidence"] == "medium"
+    assert plan[0]["cwe"] == "CWE-1427"
+    assert plan[0]["owasp_llm"] == "LLM01"
