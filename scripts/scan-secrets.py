@@ -5,7 +5,7 @@ Checks tracked working-tree content for high-confidence credential patterns and 
 files that must never be committed (.env, private keys, real WireGuard profiles,
 tunnel credentials). Soft "looks like a secret" assignments are reported for
 review but do not fail the build, because test fixtures legitimately contain
-dummy values such as api_key="do-not-forward".
+dummy values where a key name is assigned a placeholder string.
 
 Usage:  python scripts/scan-secrets.py [root]
 Exit code 0 = clean, 1 = hard match or forbidden filename found, 2 = scanner error.
@@ -50,12 +50,14 @@ FORBIDDEN_NAMES = re.compile(
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".pytest_cache", ".ruff_cache",
              ".mypy_cache", ".venv", "venv", "reports", "dist", "build"}
 
-# QuantaSentry's test suite writes a synthetic PEM header to a temporary file to
-# prove that secret-bearing files are never read. That fixture carries no key
-# material, so this one location is listed explicitly instead of weakening the
-# private-key pattern for the whole repository.
+# One location in this repository writes a synthetic PEM header to a temporary
+# file to prove that secret-bearing files are never read. That fixture carries
+# no key material, so this one location is listed explicitly instead of
+# weakening the private-key pattern for the whole repository. The allow-list
+# is applied by the scan itself, and every entry has to point at a file that
+# exists (tests/test_scan_secrets.py checks both).
 ALLOWED_MATCHES = {
-    ("tests/test_inventory.py", "Private key block"),
+    ("tests/test_scan_secrets.py", "Private key block"),
 }
 
 
@@ -82,6 +84,8 @@ def scan(root: Path):
             continue
         for label, pattern in HARD_PATTERNS:
             for match in pattern.finditer(text):
+                if (rel, label) in ALLOWED_MATCHES:
+                    continue
                 hard.append((rel, text[:match.start()].count("\n") + 1, label))
         for label, pattern in SOFT_PATTERNS:
             for match in pattern.finditer(text):
